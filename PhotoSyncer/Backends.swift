@@ -88,8 +88,7 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
         let fm = FileManager.default
         for candidate in [".\(name).partial", "\(name).partial"] {
             let existingPartial = url.appendingPathComponent(candidate)
-            if fm.fileExists(atPath: existingPartial.path) {
-                try? fm.removeItem(at: existingPartial)
+            if unlink(existingPartial.path) == 0 {
                 await MainActor.run {
                     EventLog.shared.info("Removed existing partial file \(candidate); re-copying \(name)")
                 }
@@ -102,7 +101,19 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
             // Some NAS filesystems refuse this; the file itself is fine.
             try? fm.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: partial.path)
         }
-        try fm.moveItem(at: partial, to: url.appendingPathComponent(name))
+        let final = url.appendingPathComponent(name)
+        do {
+            try fm.moveItem(at: partial, to: final)
+        } catch {
+            let ns = error as NSError
+            let isExist = (ns.domain == NSCocoaErrorDomain && ns.code == NSFileWriteFileExistsError)
+                || (ns.domain == NSPOSIXErrorDomain && ns.code == Int(EEXIST))
+                || ((ns.userInfo[NSUnderlyingErrorKey] as? NSError).map { $0.domain == NSPOSIXErrorDomain && $0.code == Int(EEXIST) } ?? false)
+            if isExist, (try? await FileHash.sha256(of: final, noCache: true)) == hash {
+                return
+            }
+            throw error
+        }
     }
 
     func download(name: String, to local: URL) async throws -> Date? {

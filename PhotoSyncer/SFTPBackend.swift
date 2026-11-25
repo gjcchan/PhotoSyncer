@@ -214,6 +214,14 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
                     try await withTimeout(30) { try await sftp.rename(at: partial, to: final) }
                     return
                 } catch is SFTPMessage.Status {
+                    if (try? await withTimeout(30) { try await sftp.getAttributes(at: final) }) != nil {
+                        if (try? await remoteHash(final)) == hash {
+                            await removeQuietly(partial)
+                            return
+                        }
+                        await removeQuietly(partial)
+                        throw SyncError.message("\(name) already exists on the SFTP server")
+                    }
                     renameUnsupported = true            // fall through to direct mode below
                 }
             } catch {
@@ -223,8 +231,9 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
             await removeQuietly(partial)
         }
 
-        // Direct mode. Never overwrite something that is already there.
+        // Direct mode. Never overwrite something that is already there unless its checksum matches.
         if (try? await withTimeout(30) { try await sftp.getAttributes(at: final) }) != nil {
+            if (try? await remoteHash(final)) == hash { return }
             throw SyncError.message("\(name) already exists on the SFTP server")
         }
         let marker = path(".\(name).inflight")

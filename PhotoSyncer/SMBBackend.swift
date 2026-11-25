@@ -81,10 +81,12 @@ nonisolated final class SMBBackend: DestinationBackend, @unchecked Sendable {
     private func open(root: URL, components: [String]) async throws {
         var base = root
         for c in components { base.appendPathComponent(c, isDirectory: true) }
-        do {
-            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        } catch {
-            throw Self.mapFileError(error, doing: "create the folder “\(components.joined(separator: "/"))” on the share")
+        if (try? base.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true {
+            do {
+                try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            } catch {
+                throw Self.mapFileError(error, doing: "create the folder “\(components.joined(separator: "/"))” on the share")
+            }
         }
         let f = FolderBackend(url: base, securityScoped: false)
         do { try await f.connect() }
