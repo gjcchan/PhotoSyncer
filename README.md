@@ -4,6 +4,13 @@ Used to help maintain iCloud capacity limits by automatically offloading photos 
 
 Requres MacOS, use at your own risk.
 
+## Setup & Requirements
+
+- **Grant Photos Access**: Allow PhotoSyncer full access to your Photos library (**System Settings › Privacy & Security › Photos**), as it relies on macOS Photos to retrieve your photos and videos.
+- **Download Originals in Photos**: In the **Photos** app, go to **Photos › Settings › iCloud** and select **Download Originals to this Mac** so full-resolution originals are available to sync.
+- **Automation (Optional Fallback)**: If PhotoKit cannot download an iCloud original directly, PhotoSyncer can ask the **Photos** app to export it via AppleScript. If prompted, allow PhotoSyncer to control **Photos** in **System Settings › Privacy & Security › Automation**.
+- **Other Optional Prompts**: Enabling **Launch at Login** may prompt for approval under **System Settings › General › Login Items**, and connecting to a LAN NAS/SFTP server may prompt for **Local Network** access. Destination folder access is granted automatically when you pick a folder.
+
 ## Features
 
 - **Menu-Bar Background Sync**: Runs quietly from the macOS menu bar on a configurable schedule (1, 4, 12, or 24 hours) with Launch at Login, Pause/Resume, and recovery across sleep/wake, network changes, and drive reconnects.
