@@ -1,0 +1,4 @@
+// Shared signing defaults.
+// Put personal Apple Developer Team ID overrides in Config/Local.xcconfig (git-ignored), e.g.:
+//   DEVELOPMENT_TEAM = YOUR_TEAM_ID
+#include? "Local.xcconfig"

@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode user-specific state & local build outputs
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+DerivedData/
+build/
+*.moved-aside
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager local build cache (keep Package.resolved tracked)
+.build/
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+
+# Local signing overrides (Apple Developer Team ID, etc.)
+Config/Local.xcconfig
