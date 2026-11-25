@@ -12,7 +12,7 @@
 
 /* Begin PBXFileReference section */
 		5E7C1D3330B3FE2C00B02D83 /* PhotoSyncer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoSyncer.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		5E7C1D6030B3FEA000B02D83 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = "<group>"; };
+		5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -38,7 +38,7 @@
 		5E7C1D2A30B3FE2C00B02D83 = {
 			isa = PBXGroup;
 			children = (
-				5E7C1D6030B3FEA000B02D83 /* Signing.xcconfig */,
+				5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */,
 				5E7C1D3530B3FE2C00B02D83 /* PhotoSyncer */,
 				5E7C1D3430B3FE2C00B02D83 /* Products */,
 			);
@@ -138,7 +138,7 @@
 /* Begin XCBuildConfiguration section */
 		5E7C1D3C30B3FE3000B02D83 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Signing.xcconfig */;
+			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -202,7 +202,7 @@
 		};
 		5E7C1D3D30B3FE3000B02D83 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Signing.xcconfig */;
+			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -258,7 +258,7 @@
 		};
 		5E7C1D3F30B3FE3000B02D83 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Signing.xcconfig */;
+			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
@@ -294,7 +294,7 @@
 		};
 		5E7C1D4030B3FE3000B02D83 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Signing.xcconfig */;
+			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;

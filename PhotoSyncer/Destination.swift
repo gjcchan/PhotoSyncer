@@ -1,9 +1,11 @@
 import Foundation
 import Security
 
-/// A place photos are copied to: a local/mounted folder, or an SFTP server.
-struct Destination: Codable, Identifiable, Hashable {
-    enum Kind: String, Codable { case folder, sftp }
+/// A place photos are copied to: a local/mounted folder, an SFTP server, or an SMB share.
+nonisolated struct Destination: Codable, Identifiable, Hashable, Sendable {
+    enum Kind: String, Codable, Sendable { case folder, sftp, smb }
+
+    static let defaultSMBPort = 445
 
     var id = UUID()
     var name: String
@@ -13,11 +15,14 @@ struct Destination: Codable, Identifiable, Hashable {
     // Folder
     var bookmark: Data?                 // security-scoped bookmark
 
-    // SFTP (the password lives in the Keychain, never here)
+    // SFTP / SMB (the password lives in the Keychain, never here)
     var host = ""
     var port = 22
     var username = ""
-    var remotePath = ""
+    var remotePath = ""                 // SFTP: folder on the server. SMB: folder inside the share ("" = share root)
+    // New fields stay optional so destinations saved by older versions still decode.
+    var share: String?                  // SMB share name
+    var guest: Bool?                    // SMB: connect without credentials
     var trustedHostKey: String?         // OpenSSH public key pinned on first connect (trust on first use)
 
     var key: String { id.uuidString }
@@ -26,6 +31,11 @@ struct Destination: Codable, Identifiable, Hashable {
         switch kind {
         case .folder: return "Folder"
         case .sftp: return "SFTP · \(username)@\(host):\(port) \(remotePath)"
+        case .smb:
+            let who = guest == true ? "guest" : username
+            let p = port == Self.defaultSMBPort ? "" : ":\(port)"
+            let sub = remotePath.trimmingCharacters(in: CharacterSet(charactersIn: "/\\ ")).isEmpty ? "" : "/\(remotePath.trimmingCharacters(in: CharacterSet(charactersIn: "/\\ ")))"
+            return "SMB · \(who)@\(host)\(p)/\(share ?? "")\(sub)"
         }
     }
 

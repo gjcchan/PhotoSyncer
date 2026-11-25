@@ -102,7 +102,7 @@ private struct ActivityTab: View {
             VStack(alignment: .leading, spacing: 4) {
                 LabeledContent("Sync", value: syncer.statusText)
                 LabeledContent("Duplicates found", value: "\(syncer.duplicatesFound)")
-                LabeledContent("Awaiting iCloud delete", value: "\(syncer.pendingDeleteCount)")
+                LabeledContent("Awaiting iCloud delete", value: syncer.pendingDeleteSummary)
             }
             .padding([.horizontal, .top], 16)
             .padding(.bottom, 8)

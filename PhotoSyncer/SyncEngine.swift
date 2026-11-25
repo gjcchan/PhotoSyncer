@@ -94,6 +94,7 @@ final class SyncEngine: ObservableObject {
     @Published var cloudWaitingCount = 0
     @Published var needsAutomationSettings = false
     @Published var pendingDeleteCount = 0
+    @Published var pendingDeleteBytes: Int64 = 0
     @Published var needsPhotosSettings = false
     @Published var needsConfirmReconcile = false
     @Published var deferredReason: String?
@@ -127,11 +128,33 @@ final class SyncEngine: ObservableObject {
     }
     @Published var libraryBytes: Int64 = 0
     @Published var libraryMeasuredAt: Date?
+    @Published var holdDeletions: Bool {
+        didSet {
+            defaults.set(holdDeletions, forKey: "holdDeletions")
+            if shouldAutoProcessDeletions { deleteRetryAt = .distantPast }
+        }
+    }
+    @Published var holdThresholdEnabled: Bool {
+        didSet {
+            defaults.set(holdThresholdEnabled, forKey: "holdThresholdEnabled")
+            if shouldAutoProcessDeletions { deleteRetryAt = .distantPast }
+        }
+    }
+    @Published var holdThresholdGB: Int {
+        didSet {
+            let clamped = min(max(holdThresholdGB, 1), 10_000)
+            if clamped != holdThresholdGB { holdThresholdGB = clamped; return }
+            defaults.set(holdThresholdGB, forKey: "holdThresholdGB")
+            if shouldAutoProcessDeletions { deleteRetryAt = .distantPast }
+        }
+    }
     @Published var deleteAfterSync: Bool {
         didSet {
             defaults.set(deleteAfterSync, forKey: "deleteAfterSync")
             if !deleteAfterSync {           // turning it off must cancel anything already queued
                 store.clearDeleteQueue()
+                pendingDeleteBytes = 0
+                defaults.set(0, forKey: "pendingDeleteBytes")
                 store.save()
                 refreshCounts()
             }
@@ -200,6 +223,20 @@ final class SyncEngine: ObservableObject {
         failedCount > 0 ? "\(failedCount) failed – retrying automatically" : nil
     }
 
+    var pendingDeleteSummary: String {
+        guard pendingDeleteCount > 0, pendingDeleteBytes > 0 else { return "\(pendingDeleteCount)" }
+        let size = ByteCountFormatter.string(fromByteCount: pendingDeleteBytes, countStyle: .file)
+        return "\(pendingDeleteCount) (\(size))"
+    }
+
+    /// Whether a scheduled/automatic sync should submit the deletion queue to macOS right now.
+    var shouldAutoProcessDeletions: Bool {
+        guard deleteAfterSync, !store.pendingDelete.isEmpty else { return false }
+        if !holdDeletions { return true }
+        guard holdThresholdEnabled else { return false }
+        return pendingDeleteBytes >= Int64(holdThresholdGB) * 1_000_000_000
+    }
+
     // MARK: Init
     init() {
         interval = SyncInterval(rawValue: defaults.integer(forKey: "interval")) ?? .h1
@@ -209,8 +246,13 @@ final class SyncEngine: ObservableObject {
         deleteStyle = style
         budgetGB = savedBudget > 0 ? savedBudget : 50
         budgetEnabled = defaults.bool(forKey: "budgetEnabled") || style == .oldest
+        holdDeletions = defaults.bool(forKey: "holdDeletions")
+        holdThresholdEnabled = defaults.bool(forKey: "holdThresholdEnabled")
+        let savedHoldGB = defaults.integer(forKey: "holdThresholdGB")
+        holdThresholdGB = savedHoldGB > 0 ? min(savedHoldGB, 10_000) : 5
         libraryBytes = Int64(defaults.integer(forKey: "libraryBytes"))
         libraryMeasuredAt = defaults.object(forKey: "libraryMeasuredAt") as? Date
+        pendingDeleteBytes = Int64(defaults.integer(forKey: "pendingDeleteBytes"))
         lastSync = defaults.object(forKey: "lastSync") as? Date
         isPaused = defaults.bool(forKey: "paused")          // pause survives restarts / login launch
         mirrorEnabled = defaults.bool(forKey: "mirrorEnabled")
@@ -240,6 +282,11 @@ final class SyncEngine: ObservableObject {
         saveDestinations()
         Destination.clearLegacy(defaults: defaults)       // safe now: the list is persisted
         for d in loaded { destStatus[d.key] = d.enabled ? "Not checked yet" : "Disabled" }
+        if store.pendingDelete.isEmpty {
+            pendingDeleteBytes = 0
+        } else if pendingDeleteBytes == 0 {
+            Task { [weak self] in await self?.updatePendingDeleteBytes() }
+        }
         refreshCounts()
 
         if !defaults.bool(forKey: "didFirstLaunch") {
@@ -330,7 +377,7 @@ final class SyncEngine: ObservableObject {
             due = true
         }
         if let r = store.nextRetryAt, now >= r { due = true }       // failed items are due again
-        if deleteAfterSync, !store.pendingDelete.isEmpty, now >= deleteRetryAt { due = true }
+        if shouldAutoProcessDeletions, now >= deleteRetryAt { due = true }
         guard due, now >= runBackoffUntil else { return }
 
         if ProcessInfo.processInfo.isLowPowerModeEnabled { deferredReason = "Waiting (Low Power Mode)"; return }
@@ -463,6 +510,20 @@ final class SyncEngine: ObservableObject {
         destinationAdded(d)
     }
 
+    func addSMBDestination(_ d: Destination, password: String) {
+        if d.guest != true {
+            let status = Keychain.setPassword(password, account: d.key)
+            guard status == errSecSuccess else {
+                lastError = "Could not store the SMB password in the Keychain (error \(status))."
+                log.error("Keychain write failed for \(d.name): \(status)")
+                return
+            }
+        }
+        destinations.append(d)
+        destStatus[d.key] = "Not checked yet"
+        destinationAdded(d)
+    }
+
     private func destinationAdded(_ d: Destination) {
         log.info("Destination added: \(d.name) (\(d.summary))")
         needsConfirmReconcile = false
@@ -474,6 +535,10 @@ final class SyncEngine: ObservableObject {
     func removeDestination(_ id: UUID) {
         guard !isSyncing else { lastError = "Wait for the current sync to finish before removing a destination."; return }
         guard let d = destinations.first(where: { $0.id == id }) else { return }
+        if d.kind == .smb {
+            let key = d.key
+            Task { await SMBBackend.cleanupMount(key: key) }
+        }
         Keychain.delete(account: d.key)
         store.removeDestination(d.key)
         store.save()
@@ -514,6 +579,20 @@ final class SyncEngine: ObservableObject {
             let files = try await backend.list().count
             await backend.close()
             return .success((box.value ?? d.trustedHostKey ?? "", files))
+        } catch {
+            await backend.close()
+            return .failure(error)
+        }
+    }
+
+    /// Used by the "Add SMB" form: mounts the share once, lists the folder, and unmounts again.
+    func testSMB(_ d: Destination, password: String) async -> Result<Int, Error> {
+        let backend = SMBBackend(dest: d, password: password)
+        do {
+            try await backend.connect()
+            let files = try await backend.list().count
+            await backend.close()
+            return .success(files)
         } catch {
             await backend.close()
             return .failure(error)
@@ -573,6 +652,13 @@ final class SyncEngine: ObservableObject {
             return SFTPBackend(dest: d, password: pw) { [weak self] hostKey in
                 Task { @MainActor [weak self] in self?.pinHostKey(key, hostKey) }
             }
+        case .smb:
+            let guest = d.guest == true
+            let pw = guest ? nil : Keychain.password(account: d.key)
+            if !guest, pw == nil {
+                throw SyncError.message("The SMB password is missing from the Keychain. Remove this destination and add it again.")
+            }
+            return SMBBackend(dest: d, password: pw)
         }
     }
 
@@ -593,6 +679,67 @@ final class SyncEngine: ObservableObject {
     }
 
     func retryFailed() { syncNow() }
+
+    /// Manually verifies every queued item across all enabled destinations and prompts macOS to delete them.
+    func deleteQueuedNow() {
+        guard !isSyncing else { lastError = "A sync is running. Try again when it finishes."; return }
+        guard !store.pendingDelete.isEmpty else { return }
+        let enabled = enabledDestinations
+        guard !enabled.isEmpty else {
+            lastError = "No destination is enabled. Enable your destination(s) so copies can be verified before deleting."
+            return
+        }
+        isSyncing = true
+        phase = "Verifying copies before iCloud delete…"
+        lastError = nil
+        needsPhotosSettings = false
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Deleting synced photos from iCloud")
+
+        Task {
+            do {
+                try await ensurePhotosAccess(requestIfNeeded: true)
+                var rts: [DestRuntime] = []
+                for d in enabled {
+                    var backend: DestinationBackend?
+                    do {
+                        let b = try makeBackend(d)
+                        backend = b
+                        setDestStatus(d, "Connecting…")
+                        try await b.connect()
+                        let files = try await b.list()
+                        rts.append(DestRuntime(dest: d, backend: b, listing: files))
+                        setDestStatus(d, "Connected · \(files.count) files")
+                    } catch {
+                        if let backend { await backend.close() }
+                        setDestStatus(d, "Error: \(error.localizedDescription)")
+                        log.error("\(d.name): \(ErrorInfo.describe(error))")
+                    }
+                }
+                active = rts
+                if rts.count == enabled.count {
+                    deleteRetryAt = .distantPast
+                    await processDeleteQueue(manual: true)
+                    await updatePendingDeleteBytes()
+                    store.save()
+                    surfaceSaveError()
+                    for rt in rts where !rt.unavailable { setDestStatus(rt.dest, "Up to date") }
+                } else {
+                    lastError = "Cannot delete from iCloud yet: every enabled destination must be online so copies can be verified."
+                }
+            } catch {
+                lastError = error.localizedDescription
+                if case SyncError.permission = error { needsPhotosSettings = true }
+            }
+            let finished = active
+            active = []
+            for rt in finished { await rt.backend.close() }
+            ProcessInfo.processInfo.endActivity(activity)
+            isSyncing = false
+            phase = nil
+            refreshCounts()
+        }
+    }
 
     // MARK: Parked items (stopped auto-retrying)
     /// Retries parked items right now. `ids == nil` retries all of them.
@@ -700,7 +847,8 @@ final class SyncEngine: ObservableObject {
 
         log.clear()
         store.resetAll()
-        for k in ["lastSync", "deleteRetryAt", "forceReconcile"] { defaults.removeObject(forKey: k) }
+        for k in ["lastSync", "deleteRetryAt", "forceReconcile", "pendingDeleteBytes"] { defaults.removeObject(forKey: k) }
+        pendingDeleteBytes = 0
         lastSync = nil
         runBackoffUntil = .distantPast
         lastError = nil
@@ -761,6 +909,8 @@ final class SyncEngine: ObservableObject {
     /// A changed deletion policy must never act on a queue built under the old one.
     private func deletePolicyChanged() {
         store.clearDeleteQueue()
+        pendingDeleteBytes = 0
+        defaults.set(0, forKey: "pendingDeleteBytes")
         store.save()
         refreshCounts()
         log.info("Delete policy changed: \(deleteStyle.label), budget \(budgetEnabled ? "\(budgetGB) GB" : "off")")
@@ -939,8 +1089,22 @@ final class SyncEngine: ObservableObject {
         try pauseCheck()
         if deleteAfter {
             await planDeletions(syncedThisRun: syncedIDs)
+            store.save()
+            refreshCounts()
             try pauseCheck()
-            await processDeleteQueue()
+            if shouldAutoProcessDeletions {
+                await processDeleteQueue(manual: false)
+                await updatePendingDeleteBytes()
+                refreshCounts()
+            } else if !store.pendingDelete.isEmpty {
+                let sz = pendingDeleteBytes > 0
+                    ? " (\(ByteCountFormatter.string(fromByteCount: pendingDeleteBytes, countStyle: .file)))" : ""
+                if holdThresholdEnabled {
+                    log.info("Holding \(store.pendingDelete.count) item(s)\(sz) in deletion queue until it reaches \(holdThresholdGB) GB (or manual delete)")
+                } else {
+                    log.info("Holding \(store.pendingDelete.count) item(s)\(sz) in deletion queue until manually triggered from the menu")
+                }
+            }
         }
         store.save()
         surfaceSaveError()
@@ -1511,6 +1675,45 @@ final class SyncEngine: ObservableObject {
         return (items, total, allSized && total > 0)
     }
 
+    nonisolated private static func measureAssets(_ ids: Set<String>) -> Int64 {
+        guard !ids.isEmpty, PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else { return 0 }
+        let sel = NSSelectorFromString("fileSize")
+        var total: Int64 = 0
+        PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil).enumerateObjects { a, _, _ in
+            for r in PHAssetResource.assetResources(for: a) where exportOrder.contains(r.type) {
+                if r.responds(to: sel), let n = r.value(forKey: "fileSize") as? NSNumber {
+                    total += n.int64Value
+                }
+            }
+        }
+        return total
+    }
+
+    private func updatePendingDeleteBytes(measured: [LibraryItem]? = nil) async {
+        let queued = store.pendingDelete
+        guard !queued.isEmpty else {
+            pendingDeleteBytes = 0
+            defaults.set(0, forKey: "pendingDeleteBytes")
+            return
+        }
+        var bytes: Int64 = 0
+        if let measured {
+            let byID = Dictionary(uniqueKeysWithValues: measured.map { ($0.id, $0.bytes) })
+            bytes = queued.reduce(0) { $0 + (byID[$1] ?? 0) }
+        } else {
+            bytes = await Task.detached { Self.measureAssets(queued) }.value
+        }
+        if bytes == 0, let rt = active.first(where: { !$0.unavailable }) {
+            for id in queued {
+                if let files = store.fileNames(for: id, dest: rt.key) {
+                    for f in files { bytes += Int64(rt.sizes[FileNames.key(f.name)] ?? 0) }
+                }
+            }
+        }
+        pendingDeleteBytes = bytes
+        defaults.set(Int(bytes), forKey: "pendingDeleteBytes")
+    }
+
     /// Decides which synced assets to queue for deletion. Never deletes when sizes are unknown.
     /// - Just synced, no budget: everything synced this run (plus anything still queued).
     /// - Just synced + budget: those same files, only while the library is over budget.
@@ -1519,6 +1722,7 @@ final class SyncEngine: ObservableObject {
     private func planDeletions(syncedThisRun: [String]) async {
         if deleteStyle == .justSynced && !budgetEnabled {
             for id in syncedThisRun where store.entry(id)?.verified == true { store.queueDelete(id) }
+            await updatePendingDeleteBytes()
             return
         }
 
@@ -1527,11 +1731,11 @@ final class SyncEngine: ObservableObject {
         let m = await Task.detached { Self.measureLibrary() }.value
         phase = nil
 
-        store.clearDeleteQueue()                      // budget plans are recomputed from scratch each run
         guard m.sizeKnown else {
             log.warning("Could not determine the iCloud library size; skipping deletion this run")
             return
         }
+        store.clearDeleteQueue()                      // budget plans are recomputed from scratch each run
         libraryBytes = m.total
         libraryMeasuredAt = Date()
         defaults.set(Int(m.total), forKey: "libraryBytes")
@@ -1541,6 +1745,7 @@ final class SyncEngine: ObservableObject {
         let excess = m.total - budget
         let fmt = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
         guard excess > 0 else {
+            await updatePendingDeleteBytes(measured: m.items)
             log.info("iCloud library is \(fmt(m.total)), within the \(budgetGB) GB budget; nothing to delete")
             return
         }
@@ -1561,6 +1766,7 @@ final class SyncEngine: ObservableObject {
             freed += item.bytes
             count += 1
         }
+        await updatePendingDeleteBytes(measured: m.items)
         log.info("iCloud library \(fmt(m.total)) is over the \(budgetGB) GB budget by \(fmt(excess)); queued \(count) item(s) (\(fmt(freed))) for deletion")
         if freed < excess {
             log.warning("Only \(fmt(freed)) can be freed from verified synced items; the library will stay over budget")
@@ -1570,7 +1776,7 @@ final class SyncEngine: ObservableObject {
     // MARK: iCloud deletion
     /// Deletes only assets that are on EVERY enabled destination, whose files there re-hash to the
     /// recorded value, that are fully exported (Live/edited/RAW parts), and not freshly modified.
-    private func processDeleteQueue() async {
+    private func processDeleteQueue(manual: Bool = false) async {
         let queued = store.pendingDelete
         guard !queued.isEmpty else { return }
 
@@ -1590,13 +1796,18 @@ final class SyncEngine: ObservableObject {
 
         let cutoff = Date().addingTimeInterval(-10 * 60)
         var toDelete: [PHAsset] = []
+        var checked = 0
         for (id, asset) in assets {
+            checked += 1
+            phase = "Verifying copies before iCloud delete (\(checked)/\(assets.count))…"
             guard let entry = store.entry(id), entry.verified, !entry.parts.isEmpty else {
                 store.dequeueDelete([id]); continue                 // unverifiable → never delete
             }
             guard store.isComplete(id, dests: enabledKeys) else { continue }   // a destination still lacks it: stays queued
-            let newest = max(asset.creationDate ?? .distantPast, asset.modificationDate ?? .distantPast)
-            if newest > cutoff { continue }                          // too fresh, stays queued
+            if !manual {
+                let newest = max(asset.creationDate ?? .distantPast, asset.modificationDate ?? .distantPast)
+                if newest > cutoff { continue }                      // too fresh, stays queued
+            }
 
             let needed = Set(Self.exportPlan(PHAssetResource.assetResources(for: asset)).map { $0.type.rawValue })
             if !needed.isSubset(of: Set(entry.parts.map(\.type))) {
@@ -1618,9 +1829,11 @@ final class SyncEngine: ObservableObject {
             }
             if intact { toDelete.append(asset) }
         }
+        phase = nil
 
         if !toDelete.isEmpty {
             do {
+                if manual { NSApp.activate(ignoringOtherApps: true) }
                 // macOS shows its own confirmation prompt.
                 try await PHPhotoLibrary.shared().performChanges {
                     PHAssetChangeRequest.deleteAssets(toDelete as NSArray)
@@ -1631,7 +1844,11 @@ final class SyncEngine: ObservableObject {
                 let cancelled = (error as? PHPhotosError)?.code == .userCancelled
                 // Don't nag: wait longer after the user declines the prompt.
                 deleteRetryAt = Date().addingTimeInterval(cancelled ? 6 * 3600 : 3600)
-                if cancelled { log.warning("iCloud delete cancelled by user; will ask again in 6 hours") }
+                if cancelled {
+                    log.warning(shouldAutoProcessDeletions
+                        ? "iCloud delete cancelled by user; will ask again in 6 hours"
+                        : "iCloud delete cancelled by user; items remain held in the deletion queue")
+                }
                 if !cancelled { lastError = "Delete from iCloud pending (will retry): \(error.localizedDescription)" }
                 if !cancelled { log.error("Delete from iCloud failed: \(error.localizedDescription)") }
                 return

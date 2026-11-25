@@ -127,6 +127,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var syncNowItem: NSMenuItem!
     private var pauseResumeItem: NSMenuItem!
     private var retryPendingItem: NSMenuItem!
+    private var deleteQueuedItem: NSMenuItem!
 
     private var settingsItem: NSMenuItem!
     private var quitItem: NSMenuItem!
@@ -186,6 +187,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         syncNowItem = actionItem("Sync Now", action: #selector(onSyncNow))
         pauseResumeItem = actionItem("Pause Sync", action: #selector(onTogglePause))
         retryPendingItem = actionItem("Retry Pending Now", action: #selector(onRetryFailed))
+        deleteQueuedItem = actionItem("Delete Queued from iCloud…", action: #selector(onDeleteQueued))
 
         settingsItem = actionItem("Settings…", action: #selector(onOpenSettings), key: ",")
         quitItem = actionItem("Quit PhotoSyncer", action: #selector(onQuit), key: "q")
@@ -196,7 +198,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             cloudDiagnosisItem, parkedItem, pendingDeleteItem, lastErrorItem,
             photosSettingsItem, openPhotosItem, automationItem, reconcileItem, loginApprovalItem,
             .separator(),
-            syncNowItem, pauseResumeItem, retryPendingItem,
+            syncNowItem, pauseResumeItem, retryPendingItem, deleteQueuedItem,
             .separator(),
             settingsItem,
             .separator(),
@@ -272,10 +274,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
                              text: syncer.parkedCount > 0 ? "⏸ \(syncer.parkedCount) stopped retrying – Settings › Failed" : nil,
                              fallbackWhenOpen: "⏸ 0 stopped retrying",
                              allowStructural: allowStructuralChanges)
-        updateOptionalStatus(pendingDeleteItem, row: pendingDeleteRow,
-                             text: syncer.pendingDeleteCount > 0 ? "\(syncer.pendingDeleteCount) awaiting iCloud delete" : nil,
-                             fallbackWhenOpen: "0 awaiting iCloud delete",
-                             allowStructural: allowStructuralChanges)
+        pendingDeleteRow.setText("Deletion queue: \(syncer.pendingDeleteSummary)", resizeHeight: allowStructuralChanges)
         updateOptionalStatus(lastErrorItem, row: lastErrorRow,
                              text: syncer.lastError.map { "⚠️ \($0)" },
                              fallbackWhenOpen: "",
@@ -301,6 +300,14 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             let retryTitle = "Retry \(pending) Pending Now"
             if retryPendingItem.title != retryTitle { retryPendingItem.title = retryTitle }
             if retryPendingItem.isEnabled != !busy { retryPendingItem.isEnabled = !busy }
+        }
+
+        let queuedDeletes = syncer.pendingDeleteCount
+        setHidden(deleteQueuedItem, queuedDeletes == 0)
+        if queuedDeletes > 0 {
+            let delTitle = "Delete \(syncer.pendingDeleteSummary) Queued from iCloud…"
+            if deleteQueuedItem.title != delTitle { deleteQueuedItem.title = delTitle }
+            if deleteQueuedItem.isEnabled != !syncer.isSyncing { deleteQueuedItem.isEnabled = !syncer.isSyncing }
         }
     }
 
@@ -358,6 +365,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func onSyncNow() { syncer.syncNow() }
     @objc private func onTogglePause() { if syncer.isPaused { syncer.resume() } else { syncer.pause() } }
     @objc private func onRetryFailed() { syncer.retryFailed() }
+    @objc private func onDeleteQueued() { syncer.deleteQueuedNow() }
     @objc private func onOpenSettings() { showSettings() }
     @objc private func onQuit() { NSApplication.shared.terminate(nil) }
 }
