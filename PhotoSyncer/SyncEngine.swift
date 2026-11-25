@@ -680,6 +680,40 @@ final class SyncEngine: ObservableObject {
 
     func retryFailed() { syncNow() }
 
+    /// Queues all live library items that are already verified in the ledger and present on every
+    /// enabled destination (useful when enabling deletion or hold-queue after items were already synced).
+    func queueAlreadySynced() {
+        guard deleteAfterSync, !isSyncing else { return }
+        let enabledKeys = enabledDestinations.map(\.key)
+        Task {
+            do {
+                try await ensurePhotosAccess(requestIfNeeded: true)
+            } catch {
+                lastError = error.localizedDescription
+                if case SyncError.permission = error { needsPhotosSettings = true }
+                return
+            }
+            let liveIDs = await Task.detached { Self.allLibraryIDs() }.value
+            var added = 0
+            for id in liveIDs {
+                guard store.entry(id)?.verified == true, !store.pendingDelete.contains(id) else { continue }
+                guard enabledKeys.isEmpty || store.isComplete(id, dests: enabledKeys) else { continue }
+                store.queueDelete(id)
+                added += 1
+            }
+            if added > 0 {
+                await updatePendingDeleteBytes()
+                store.save()
+                surfaceSaveError()
+                refreshCounts()
+                log.info("Queued \(added) already-synced verified item(s) for iCloud deletion")
+                if shouldAutoProcessDeletions { deleteRetryAt = .distantPast }
+            } else {
+                log.info("No additional already-synced verified items in Photos to queue")
+            }
+        }
+    }
+
     /// Manually verifies every queued item across all enabled destinations and prompts macOS to delete them.
     func deleteQueuedNow() {
         guard !isSyncing else { lastError = "A sync is running. Try again when it finishes."; return }
@@ -1114,16 +1148,28 @@ final class SyncEngine: ObservableObject {
         if failedThisRun > 0 || cloudThisRun > 0 { log.warning(summary) } else { log.info(summary) }
     }
 
-    nonisolated private static func scanLibrary(known: Set<String>, skip: Set<String>)
-        -> (pending: [String], live: Set<String>) {
+    nonisolated private static func libraryFetchOptions() -> PHFetchOptions {
         let opts = PHFetchOptions()
         opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         opts.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
                                      PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
         opts.includeAssetSourceTypes = [.typeUserLibrary]   // shared-album items can't be deleted/owned
+        return opts
+    }
+
+    nonisolated private static func allLibraryIDs() -> [String] {
+        var ids: [String] = []
+        PHAsset.fetchAssets(with: libraryFetchOptions()).enumerateObjects { a, _, _ in
+            ids.append(a.localIdentifier)
+        }
+        return ids
+    }
+
+    nonisolated private static func scanLibrary(known: Set<String>, skip: Set<String>)
+        -> (pending: [String], live: Set<String>) {
         var pending: [String] = []
         var live = Set<String>()
-        PHAsset.fetchAssets(with: opts).enumerateObjects { a, _, _ in
+        PHAsset.fetchAssets(with: libraryFetchOptions()).enumerateObjects { a, _, _ in
             live.insert(a.localIdentifier)
             if !known.contains(a.localIdentifier) && !skip.contains(a.localIdentifier) {
                 pending.append(a.localIdentifier)
@@ -1653,26 +1699,27 @@ final class SyncEngine: ObservableObject {
 
     // MARK: Deletion planning (style + data budget)
     nonisolated private static func measureLibrary() -> (items: [LibraryItem], total: Int64, sizeKnown: Bool) {
-        let opts = PHFetchOptions()
-        opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]   // oldest first
-        opts.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
-                                     PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
-        opts.includeAssetSourceTypes = [.typeUserLibrary]
         // PhotoKit has no public file-size API; PHAssetResource exposes `fileSize` (checked before use).
         let sel = NSSelectorFromString("fileSize")
         var items: [LibraryItem] = []
         var total: Int64 = 0
-        var allSized = true
-        PHAsset.fetchAssets(with: opts).enumerateObjects { a, _, _ in
+        PHAsset.fetchAssets(with: libraryFetchOptions()).enumerateObjects { a, _, _ in
             var bytes: Int64 = 0
+            var missingSize = false
             for r in PHAssetResource.assetResources(for: a) where exportOrder.contains(r.type) {
-                if r.responds(to: sel), let n = r.value(forKey: "fileSize") as? NSNumber { bytes += n.int64Value }
-                else { allSized = false }
+                if r.responds(to: sel), let n = r.value(forKey: "fileSize") as? NSNumber, n.int64Value > 0 {
+                    bytes += n.int64Value
+                } else {
+                    missingSize = true
+                }
+            }
+            if bytes == 0 && missingSize {
+                bytes = estimatedBytes(a)
             }
             total += bytes
             items.append(LibraryItem(id: a.localIdentifier, date: a.creationDate ?? .distantPast, bytes: bytes))
         }
-        return (items, total, allSized && total > 0)
+        return (items, total, items.isEmpty || total > 0)
     }
 
     nonisolated private static func measureAssets(_ ids: Set<String>) -> Int64 {

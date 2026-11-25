@@ -6,6 +6,7 @@ struct DeleteOptionsView: View {
     @State private var draftBudgetGB: Int = 50
     @State private var pendingLowerBudget: Int?
     @State private var showOldestWarning = false
+    @State private var showQueueSyncedConfirm = false
     @State private var stepperTask: Task<Void, Never>?
     @FocusState private var budgetFocused: Bool
 
@@ -116,6 +117,17 @@ struct DeleteOptionsView: View {
                     Text(holdSummary).font(.caption).foregroundStyle(.secondary)
                 }
 
+                if syncer.deleteStyle == .justSynced {
+                    Section("Already-synced items") {
+                        Text("Items synced before you turned this on aren't queued automatically on re-sync.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("Queue Already-Synced Items…") {
+                            showQueueSyncedConfirm = true
+                        }
+                        .disabled(syncer.isSyncing)
+                    }
+                }
+
                 Section("Summary") {
                     Text(summary)
                     Text("Only files that were copied, checksum-verified and re-checked just before deletion are ever removed. macOS still asks you to confirm each deletion batch.")
@@ -174,6 +186,14 @@ struct DeleteOptionsView: View {
             }
         } message: {
             Text(oldestStyleMessage)
+        }
+        .alert("Queue already-synced items for deletion?", isPresented: $showQueueSyncedConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Queue Already-Synced Items", role: .destructive) {
+                syncer.queueAlreadySynced()
+            }
+        } message: {
+            Text("This queues all verified photos and videos that have already been synced to every enabled destination. Every file will still be checksum-verified again across all destinations before macOS asks you to confirm deletion.")
         }
     }
 
