@@ -347,8 +347,17 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" || $0.title == "PhotoSyncer"
         }) {
             win.title = "PhotoSyncer"
-            win.styleMask.insert([.resizable, .miniaturizable])
-            win.contentMinSize = NSSize(width: 760, height: 520)
+            if !win.styleMask.contains(.resizable) || !win.styleMask.contains(.miniaturizable) {
+                win.styleMask.insert([.resizable, .miniaturizable])
+            }
+            let minSize = NSSize(width: 760, height: 520)
+            if win.contentMinSize != minSize { win.contentMinSize = minSize }
+            if win.contentMaxSize.width < 10_000 || win.contentMaxSize.height < 10_000 {
+                win.contentMaxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            }
+            if win.maxSize.width < 10_000 || win.maxSize.height < 10_000 {
+                win.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            }
             win.collectionBehavior.insert(.moveToActiveSpace)
             if win.isMiniaturized { win.deminiaturize(nil) }
             win.orderFrontRegardless()

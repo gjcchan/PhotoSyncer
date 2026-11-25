@@ -8,7 +8,7 @@ struct PhotoSyncerApp: App {
         Settings {
             SettingsView(syncer: appDelegate.syncer)
         }
-        .defaultSize(width: 820, height: 580)
+        .defaultSize(width: 820, height: 600)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appSettings) {
