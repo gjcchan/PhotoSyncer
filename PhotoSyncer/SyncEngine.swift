@@ -680,6 +680,21 @@ final class SyncEngine: ObservableObject {
 
     func retryFailed() { syncNow() }
 
+    /// Counts live library items that are already verified in the ledger, present on every enabled
+    /// destination, and not yet in the deletion queue (without prompting for Photos access).
+    func countQueueableAlreadySynced() async -> Int {
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else { return 0 }
+        let enabledKeys = enabledDestinations.map(\.key)
+        let liveIDs = await Task.detached { Self.allLibraryIDs() }.value
+        var count = 0
+        for id in liveIDs {
+            guard store.entry(id)?.verified == true, !store.pendingDelete.contains(id) else { continue }
+            guard enabledKeys.isEmpty || store.isComplete(id, dests: enabledKeys) else { continue }
+            count += 1
+        }
+        return count
+    }
+
     /// Queues all live library items that are already verified in the ledger and present on every
     /// enabled destination (useful when enabling deletion or hold-queue after items were already synced).
     func queueAlreadySynced() {

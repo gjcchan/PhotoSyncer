@@ -7,6 +7,7 @@ struct DeleteOptionsView: View {
     @State private var pendingLowerBudget: Int?
     @State private var showOldestWarning = false
     @State private var showQueueSyncedConfirm = false
+    @State private var previouslySyncedPromptCount: Int?
     @State private var stepperTask: Task<Void, Never>?
     @FocusState private var budgetFocused: Bool
 
@@ -44,7 +45,17 @@ struct DeleteOptionsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Delete from iCloud after sync", isOn: $syncer.deleteAfterSync)
+                Toggle("Delete from iCloud after sync", isOn: Binding(
+                    get: { syncer.deleteAfterSync },
+                    set: { newValue in
+                        syncer.deleteAfterSync = newValue
+                        guard newValue else { return }
+                        Task {
+                            let count = await syncer.countQueueableAlreadySynced()
+                            if count > 0 { previouslySyncedPromptCount = count }
+                        }
+                    }
+                ))
             }
 
             Group {
@@ -194,6 +205,24 @@ struct DeleteOptionsView: View {
             }
         } message: {
             Text("This queues all verified photos and videos that have already been synced to every enabled destination. Every file will still be checksum-verified again across all destinations before macOS asks you to confirm deletion.")
+        }
+        .alert(
+            "Delete \(previouslySyncedPromptCount ?? 0) previously synced \(previouslySyncedPromptCount == 1 ? "file" : "files") from iCloud?",
+            isPresented: Binding(
+                get: { previouslySyncedPromptCount != nil },
+                set: { if !$0 { previouslySyncedPromptCount = nil } }
+            )
+        ) {
+            Button("Keep Only Future Syncs", role: .cancel) {
+                previouslySyncedPromptCount = nil
+            }
+            Button("Queue \(previouslySyncedPromptCount ?? 0) \(previouslySyncedPromptCount == 1 ? "File" : "Files")", role: .destructive) {
+                previouslySyncedPromptCount = nil
+                syncer.queueAlreadySynced()
+            }
+        } message: {
+            let count = previouslySyncedPromptCount ?? 0
+            Text("You have \(count) verified \(count == 1 ? "photo or video" : "photos and videos") already synced from previous runs. Would you like to queue them for iCloud deletion as well?\n\nEvery copy will still be re-verified across all enabled destinations before macOS asks you to confirm.")
         }
     }
 
