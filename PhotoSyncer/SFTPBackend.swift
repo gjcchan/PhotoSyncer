@@ -196,8 +196,18 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
         let sftp = try client()
         let final = path(name)
 
+        for candidate in [".\(name).partial", "\(name).partial"] {
+            let existingPartial = path(candidate)
+            if (try? await withTimeout(30) { try await sftp.getAttributes(at: existingPartial) }) != nil {
+                await removeQuietly(existingPartial)
+                await MainActor.run {
+                    EventLog.shared.info("Removed existing partial file \(candidate) on \(self.host); re-copying \(name)")
+                }
+            }
+        }
+
         if !renameUnsupported {
-            let partial = path(".\(UUID().uuidString).partial")
+            let partial = path(".\(name).partial")
             do {
                 try await writeAndVerify(local: local, to: partial, size: size, hash: hash)
                 do {

@@ -85,14 +85,24 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
     }
 
     func upload(local: URL, as name: String, size: UInt64, hash: String, date: Date?) async throws {
-        let partial = url.appendingPathComponent(".\(UUID().uuidString).partial")
-        defer { try? FileManager.default.removeItem(at: partial) }       // no-op after the rename
+        let fm = FileManager.default
+        for candidate in [".\(name).partial", "\(name).partial"] {
+            let existingPartial = url.appendingPathComponent(candidate)
+            if fm.fileExists(atPath: existingPartial.path) {
+                try? fm.removeItem(at: existingPartial)
+                await MainActor.run {
+                    EventLog.shared.info("Removed existing partial file \(candidate); re-copying \(name)")
+                }
+            }
+        }
+        let partial = url.appendingPathComponent(".\(name).partial")
+        defer { try? fm.removeItem(at: partial) }       // no-op after the rename
         try await VerifiedCopy.copy(from: local, to: partial, expectedHash: hash, expectedSize: size)
         if let date {
             // Some NAS filesystems refuse this; the file itself is fine.
-            try? FileManager.default.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: partial.path)
+            try? fm.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: partial.path)
         }
-        try FileManager.default.moveItem(at: partial, to: url.appendingPathComponent(name))
+        try fm.moveItem(at: partial, to: url.appendingPathComponent(name))
     }
 
     func download(name: String, to local: URL) async throws -> Date? {
