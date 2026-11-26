@@ -256,7 +256,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
             : syncer.isSyncing
             ? "arrow.triangle.2.circlepath.icloud.fill"
             : (syncer.failedCount > 0 || syncer.destinationProblem != nil
-               ? "exclamationmark.icloud" : "icloud.and.arrow.down")
+               ? "exclamationmark.icloud" : "icloud")
         guard symbol != currentSymbol else { return }
         currentSymbol = symbol
         let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "PhotoSyncer")
