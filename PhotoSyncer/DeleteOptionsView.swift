@@ -128,6 +128,8 @@ struct DeleteOptionsView: View {
                     Text(holdSummary).font(.caption).foregroundStyle(.secondary)
                 }
 
+                AutoConfirmDeleteSettingsSection(controller: syncer.autoConfirm)
+
                 if syncer.deleteStyle == .justSynced {
                     Section("Already-synced items") {
                         Text("Items synced before you turned this on aren't queued automatically on re-sync.")

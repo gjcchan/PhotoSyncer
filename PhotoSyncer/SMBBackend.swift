@@ -62,7 +62,7 @@ nonisolated final class SMBBackend: DestinationBackend, @unchecked Sendable {
     var localRoot: URL? { nil }
 
     static var mountsRoot: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let base = SandboxCompat.appSupportDirectory
             .appendingPathComponent("Mounts", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base.resolvingSymlinksInPath()
