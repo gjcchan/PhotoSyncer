@@ -28,8 +28,7 @@ final class EventLog: ObservableObject {
     }()
 
     private init() {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = SandboxCompat.appSupportDirectory
         fileURL = dir.appendingPathComponent("PhotoSyncer.log.jsonl")
         loadRecent()
     }

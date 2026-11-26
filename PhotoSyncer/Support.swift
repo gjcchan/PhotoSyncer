@@ -793,8 +793,7 @@ nonisolated final class InstanceLock: @unchecked Sendable {
     private var fd: Int32 = -1
 
     init(directory: URL? = nil) {
-        let dir = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = directory ?? SandboxCompat.appSupportDirectory
         lockPath = dir.appendingPathComponent("photosyncer.lock").path
     }
 

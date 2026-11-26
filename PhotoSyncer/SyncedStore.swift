@@ -86,7 +86,7 @@ final class SyncedStore {
     // MARK: Load / migrate
     /// `legacyDestinationID`: the single destination older versions used; their files map onto it.
     init(legacyDestinationID: String?, directory: URL? = nil) {
-        let dir = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = directory ?? SandboxCompat.appSupportDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         url = dir.appendingPathComponent("synced-ledger-v4.json")
         backupURL = dir.appendingPathComponent("synced-ledger-v4.json.bak")

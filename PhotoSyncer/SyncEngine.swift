@@ -193,6 +193,7 @@ final class SyncEngine: ObservableObject {
     private var scrubOffsets: [String: Int] = [:]        // per-destination rolling checksum scrub cursor
     private var schedulerTask: Task<Void, Never>?
     let cloudClock = CloudCountdown()
+    let autoConfirm = DeleteAutoConfirmController()
     private var clockTask: Task<Void, Never>?
     private var lastClockTick = Date.distantPast
     private var photosFallbackBlockedUntil = Date.distantPast
@@ -615,7 +616,7 @@ final class SyncEngine: ObservableObject {
             return
         }
         do {
-            let bookmark = try url.bookmarkData(options: .withSecurityScope)
+            let bookmark = try SandboxCompat.createBookmark(for: url)
             let d = Destination(name: url.lastPathComponent, kind: .folder, bookmark: bookmark)
             destinations.append(d)
             destStatus[d.key] = "Not checked yet"
@@ -727,16 +728,11 @@ final class SyncEngine: ObservableObject {
     }
 
     private func folderURL(_ d: Destination) -> URL? {
-        guard let data = d.bookmark else { return nil }
-        var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
-                                 relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
-        if stale, url.startAccessingSecurityScopedResource() {
-            defer { url.stopAccessingSecurityScopedResource() }
-            if let fresh = try? url.bookmarkData(options: .withSecurityScope),
-               let i = destinations.firstIndex(where: { $0.id == d.id }) { destinations[i].bookmark = fresh }
+        guard let data = d.bookmark, let r = try? SandboxCompat.resolveBookmark(data) else { return nil }
+        if let fresh = r.refreshedBookmark, let i = destinations.firstIndex(where: { $0.id == d.id }) {
+            destinations[i].bookmark = fresh
         }
-        return url
+        return r.url
     }
 
     /// Non-blocking reachability check used only to decide whether a retry is worth attempting.
@@ -756,16 +752,12 @@ final class SyncEngine: ObservableObject {
             guard let data = d.bookmark else {
                 throw SyncError.message("The folder reference is missing. Remove this destination and add it again.")
             }
-            var stale = false
             do {
-                let url = try URL(resolvingBookmarkData: data, options: .withSecurityScope,
-                                  relativeTo: nil, bookmarkDataIsStale: &stale)
-                if stale, url.startAccessingSecurityScopedResource() {
-                    defer { url.stopAccessingSecurityScopedResource() }
-                    if let fresh = try? url.bookmarkData(options: .withSecurityScope),
-                       let i = destinations.firstIndex(where: { $0.id == d.id }) { destinations[i].bookmark = fresh }
+                let r = try SandboxCompat.resolveBookmark(data)
+                if let fresh = r.refreshedBookmark, let i = destinations.firstIndex(where: { $0.id == d.id }) {
+                    destinations[i].bookmark = fresh
                 }
-                return FolderBackend(url: url)
+                return FolderBackend(url: r.url)
             } catch {
                 let ns = error as NSError
                 if ns.domain == NSCocoaErrorDomain && (ns.code == NSFileNoSuchFileError || ns.code == NSFileReadNoSuchFileError) {
@@ -1544,7 +1536,7 @@ final class SyncEngine: ObservableObject {
     }
 
     private func ensureLocalSpace(needed: Int64) throws {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let appSupport = SandboxCompat.appSupportDirectory
         let stagingParent = stagingDir.deletingLastPathComponent()
         let required = max(needed, 0) + Self.localReserveBytes
         for dir in [appSupport, stagingParent] {
@@ -2382,10 +2374,12 @@ final class SyncEngine: ObservableObject {
 
         if !toDelete.isEmpty {
             do {
-                if manual { NSApp.activate(ignoringOtherApps: true) }
-                // macOS shows its own confirmation prompt.
-                try await PHPhotoLibrary.shared().performChanges {
-                    PHAssetChangeRequest.deleteAssets(toDelete as NSArray)
+                if manual && !autoConfirm.willAutoConfirm { NSApp.activate(ignoringOtherApps: true) }
+                // macOS shows its own confirmation prompt (auto-confirmed only when explicitly enabled).
+                try await autoConfirm.performDeletion(expectedCount: toDelete.count) {
+                    try await PHPhotoLibrary.shared().performChanges {
+                        PHAssetChangeRequest.deleteAssets(toDelete as NSArray)
+                    }
                 }
                 store.dequeueDelete(toDelete.map(\.localIdentifier))
                 store.save()

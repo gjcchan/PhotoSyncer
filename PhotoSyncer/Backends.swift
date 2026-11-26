@@ -36,7 +36,7 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
     private let securityScoped: Bool       // false for folders we created ourselves (e.g. inside our SMB mount)
     private var scoped = false
 
-    init(url: URL, securityScoped: Bool = true) {
+    init(url: URL, securityScoped: Bool = SandboxCompat.isSandboxed) {
         self.url = url
         self.securityScoped = securityScoped
     }
