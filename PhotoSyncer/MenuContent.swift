@@ -95,6 +95,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var cancellables = Set<AnyCancellable>()
     private var isMenuOpen = false
     private var refreshScheduled = false
+    private var isTerminating = false
     private var currentSymbol = ""
 
     // Persistent status rows (updated in-place without mutating NSMenu structure)
@@ -150,6 +151,21 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         syncer.cloudClock.objectWillChange
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isTerminating { return .terminateLater }
+        if !syncer.hasActiveWork {
+            syncer.flushForTermination()
+            return .terminateNow
+        }
+        isTerminating = true
+        CFRunLoopAddCommonMode(CFRunLoopGetMain(), CFRunLoopMode(RunLoop.Mode.modalPanel.rawValue as CFString))
+        Task { @MainActor in
+            await syncer.prepareForTermination()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     private func viewItem(_ view: StatusRowView) -> NSMenuItem {

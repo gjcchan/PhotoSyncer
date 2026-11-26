@@ -3,6 +3,27 @@ import NetFS
 
 // MARK: - SMB
 
+/// Serializes mount/unmount operations per destination key so startup orphan cleanup
+/// and an active sync can never race on the same mount directory.
+private actor MountGate {
+    static let shared = MountGate()
+    private var busy = Set<String>()
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func withKey<T: Sendable>(_ key: String, _ body: @Sendable () async throws -> T) async rethrows -> T {
+        while busy.contains(key) {
+            await withCheckedContinuation { waiters[key, default: []].append($0) }
+        }
+        busy.insert(key)
+        defer {
+            busy.remove(key)
+            let list = waiters.removeValue(forKey: key) ?? []
+            for w in list { w.resume() }
+        }
+        return try await body()
+    }
+}
+
 /// An SMB share, connected with macOS's own SMB client (the one Finder uses) and then used like a folder.
 ///
 /// The share is mounted by NetFS at a private mount point inside the app's sandbox container, so no extra
@@ -10,26 +31,30 @@ import NetFS
 /// `.partial` → final rename, checksum read-back with `F_NOCACHE`, listing, deleting) reuses `FolderBackend`,
 /// so SMB gets exactly the same verification as a local or USB folder.
 nonisolated final class SMBBackend: DestinationBackend, @unchecked Sendable {
+    private let key: String
     private let host: String
     private let port: Int
     private let share: String
     private let user: String?            // nil = guest
     private let password: String?
     private let subfolder: String
+    private let allowCreateBase: Bool
     private let mountDir: URL
     private var folder: FolderBackend?
 
     /// NetFS gives up on an unreachable server by itself after about a minute; this is only a safety net.
     private static let mountTimeout: TimeInterval = 90
 
-    init(dest: Destination, password: String?) {
+    init(dest: Destination, password: String?, allowCreateBase: Bool = true) {
         let guest = dest.guest == true
+        key = dest.key
         host = dest.host.trimmingCharacters(in: .whitespaces)
         port = dest.port
         share = (dest.share ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/\\ "))
         user = guest ? nil : dest.username
         self.password = guest ? nil : password
         subfolder = dest.remotePath
+        self.allowCreateBase = allowCreateBase
         mountDir = Self.mountsRoot.appendingPathComponent(dest.key, isDirectory: true)
     }
 
@@ -44,37 +69,51 @@ nonisolated final class SMBBackend: DestinationBackend, @unchecked Sendable {
     }
 
     static func cleanupMount(key: String) async {
-        let dir = mountsRoot.appendingPathComponent(key, isDirectory: true)
-        if isSMBMount(dir) {
-            _ = try? await withTimeout(30, timeoutMessage: "Unmounting timed out") {
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    FileManager.default.unmountVolume(at: dir, options: [.withoutUI]) { _ in cont.resume() }
+        await MountGate.shared.withKey(key) {
+            let dir = mountsRoot.appendingPathComponent(key, isDirectory: true)
+            if isSMBMount(dir) {
+                _ = try? await withTimeout(30, timeoutMessage: "Unmounting timed out") {
+                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        FileManager.default.unmountVolume(at: dir, options: [.withoutUI]) { _ in cont.resume() }
+                    }
                 }
             }
+            if !isSMBMount(dir) {
+                try? FileManager.default.removeItem(at: dir)
+            }
         }
-        if !isSMBMount(dir) {
-            try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// Unmounts and removes any leftover mount directories from a previous crash that aren't in active use.
+    static func cleanupOrphanedMounts(keeping activeKeys: Set<String>) async {
+        let root = mountsRoot
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        for dir in entries where !activeKeys.contains(dir.lastPathComponent) {
+            await cleanupMount(key: dir.lastPathComponent)
         }
     }
 
     // MARK: Connection
     func connect() async throws {
-        let components = try Self.subfolderComponents(subfolder)
-        let reused = Self.isSMBMount(mountDir)             // left over from a crash or a failed unmount
-        let root = reused ? mountDir : try await mount()
-        do {
-            try await open(root: root, components: components)
-        } catch {
-            // A leftover mount whose server has gone away: drop it and mount afresh, once.
-            if reused, case SyncError.destinationUnavailable = error {
-                await unmountQuietly(root)
-                let fresh = try await mount()
-                do { try await open(root: fresh, components: components) }
-                catch { await unmountQuietly(fresh); throw error }
-                return
+        try await MountGate.shared.withKey(key) {
+            let components = try Self.subfolderComponents(self.subfolder)
+            let reused = Self.isSMBMount(self.mountDir)             // left over from a crash or a failed unmount
+            let root = reused ? self.mountDir : try await self.mount()
+            do {
+                try await self.open(root: root, components: components)
+            } catch {
+                // A leftover mount whose server has gone away: drop it and mount afresh, once.
+                if reused, case SyncError.destinationUnavailable = error {
+                    await self.unmountQuietly(root)
+                    let fresh = try await self.mount()
+                    do { try await self.open(root: fresh, components: components) }
+                    catch { await self.unmountQuietly(fresh); throw error }
+                    return
+                }
+                await self.unmountQuietly(root)
+                throw error
             }
-            await unmountQuietly(root)
-            throw error
         }
     }
 
@@ -82,6 +121,10 @@ nonisolated final class SMBBackend: DestinationBackend, @unchecked Sendable {
         var base = root
         for c in components { base.appendPathComponent(c, isDirectory: true) }
         if (try? base.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true {
+            guard allowCreateBase else {
+                throw SyncError.destinationUnavailable(
+                    "Folder “\(components.joined(separator: "/"))” is missing on the SMB share (backing volume unmounted on \(host)?)")
+            }
             do {
                 try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
             } catch {
@@ -245,14 +288,20 @@ nonisolated final class SMBBackend: DestinationBackend, @unchecked Sendable {
 
     func delete(name: String) async throws { try await backend().delete(name: name) }
 
+    func readCanary() async throws -> String? { try await backend().readCanary() }
+
+    func writeCanary(_ id: String) async throws { try await backend().writeCanary(id) }
+
     func cleanup() async { await folder?.cleanup() }
 
     func close() async {
-        await folder?.close()
-        folder = nil
-        await unmountQuietly(mountDir)
-        if !Self.isSMBMount(mountDir) {
-            try? FileManager.default.removeItem(at: mountDir)
+        await MountGate.shared.withKey(key) {
+            await self.folder?.close()
+            self.folder = nil
+            await self.unmountQuietly(self.mountDir)
+            if !Self.isSMBMount(self.mountDir) {
+                try? FileManager.default.removeItem(at: self.mountDir)
+            }
         }
     }
 }

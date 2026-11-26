@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import Photos
+import AVFoundation
 import ServiceManagement
 import AppKit
 import ImageIO
@@ -12,6 +13,7 @@ private final class DestRuntime {
     let backend: DestinationBackend
     var listing: [RemoteFile]
     var names: Set<String>                 // normalized names currently present
+    var actualNames: [String: String]      // normalized key -> actual filename on destination
     var sizes: [String: UInt64]
     var unavailable = false                // went offline / was skipped during this run
 
@@ -23,7 +25,22 @@ private final class DestRuntime {
         self.backend = backend
         self.listing = listing
         names = Set(listing.map { FileNames.key($0.name) })
+        actualNames = Dictionary(listing.map { (FileNames.key($0.name), $0.name) }, uniquingKeysWith: { a, _ in a })
         sizes = Dictionary(listing.map { (FileNames.key($0.name), $0.size) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    func recordFile(name: String, size: UInt64) {
+        let k = FileNames.key(name)
+        names.insert(k)
+        actualNames[k] = name
+        sizes[k] = size
+    }
+
+    func removeFile(name: String) {
+        let k = FileNames.key(name)
+        names.remove(k)
+        actualNames[k] = nil
+        sizes[k] = nil
     }
 }
 
@@ -48,6 +65,7 @@ private struct StagedFile {
 @MainActor
 final class SyncEngine: ObservableObject {
     static let chunkSize = 10
+    static let localReserveBytes: Int64 = 500_000_000        // keep at least 500 MB free on the startup disk
     /// Photos resources we export, in priority order (primary first).
     nonisolated private static let exportOrder: [PHAssetResourceType] =
         [.photo, .video, .fullSizePhoto, .fullSizeVideo, .alternatePhoto, .pairedVideo, .fullSizePairedVideo]
@@ -164,10 +182,15 @@ final class SyncEngine: ObservableObject {
     // MARK: Private state
     private let defaults = UserDefaults.standard
     private let log = EventLog.shared
+    private let instanceLock = InstanceLock()
     private let legacyDestinationID: String?
     private lazy var store = SyncedStore(legacyDestinationID: legacyDestinationID)
     private let network = NetworkMonitor()
     private var active: [DestRuntime] = []               // destinations connected for the current run
+    private var activeTask: Task<Void, Never>?           // running sync or manual deletion task
+    private var isTerminating = false                    // app quit / logout / OS restart in progress
+    private var isTicking = false                        // prevents overlapping async reachability probes
+    private var scrubOffsets: [String: Int] = [:]        // per-destination rolling checksum scrub cursor
     private var schedulerTask: Task<Void, Never>?
     let cloudClock = CloudCountdown()
     private var clockTask: Task<Void, Never>?
@@ -268,11 +291,11 @@ final class SyncEngine: ObservableObject {
         destinations = loaded
         legacyDestinationID = migrated?.key ?? loaded.first(where: { $0.kind == .folder })?.key
 
-        // Single instance: two processes would race on the ledger.
+        // Single instance: kernel-enforced advisory lock prevents two processes from racing on the ledger.
         let me = Bundle.main.bundleIdentifier ?? ""
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: me)
-            .filter { $0 != NSRunningApplication.current }
-        if !others.isEmpty {
+            .filter { $0 != NSRunningApplication.current && !$0.isTerminated }
+        if !instanceLock.acquire(retryTimeout: others.isEmpty ? 1.5 : 0.4) {
             DispatchQueue.main.async { NSApp.terminate(nil) }
             return
         }
@@ -311,6 +334,9 @@ final class SyncEngine: ObservableObject {
                 let vol = n.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
                 MainActor.assumeIsolated { self?.volumeEvent(mounted: false, volume: vol) }
             },
+            nc.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.systemWillPowerOff() }
+            },
         ]
         startScheduler()
         startClock()
@@ -345,7 +371,7 @@ final class SyncEngine: ObservableObject {
                 if !self.isSyncing, !self.isPaused, let next = self.store.nextCloudRetryAt, next <= Date(),
                    Date().timeIntervalSince(self.lastClockTick) > 15 {
                     self.lastClockTick = Date()
-                    self.tick()
+                    await self.tick()
                 }
             }
         }
@@ -354,15 +380,29 @@ final class SyncEngine: ObservableObject {
     // MARK: Scheduling
     private func startScheduler() {
         schedulerTask = Task { [weak self] in
+            var firstIteration = true
             while !Task.isCancelled {
-                self?.tick()
+                await self?.tick()
+                if firstIteration {
+                    firstIteration = false
+                    if let self {
+                        let keep = self.isSyncing
+                            ? Set(self.enabledDestinations.filter { $0.kind == .smb }.map(\.key))
+                            : Set<String>()
+                        Task.detached(priority: .utility) {
+                            await SMBBackend.cleanupOrphanedMounts(keeping: keep)
+                        }
+                    }
+                }
                 try? await Task.sleep(for: .seconds(60))
             }
         }
     }
 
-    private func tick() {
-        guard !isSyncing, !isPaused, !sleepPause, Date() >= wakeSettleUntil else { return }
+    private func tick() async {
+        guard !isTicking, !isSyncing, !isPaused, !sleepPause, !isTerminating, Date() >= wakeSettleUntil else { return }
+        isTicking = true
+        defer { isTicking = false }
         let now = Date()
         if let ls = lastSync, ls > now { lastSync = now }          // clock moved backwards
         let enabled = enabledDestinations
@@ -371,7 +411,11 @@ final class SyncEngine: ObservableObject {
         var due = lastSync.map { now.timeIntervalSince($0) >= interval.seconds } ?? true
         if needsResume { due = true }                               // an earlier run was cut short
         if waitingForDestination {
-            guard enabled.contains(where: { maybeReachable($0) }) else { return }   // cheap check, once a minute
+            var anyReachable = false
+            for d in enabled {
+                if await maybeReachable(d) { anyReachable = true; break }
+            }
+            guard anyReachable else { return }                      // non-blocking check, once a minute
             setWaiting(false, "A destination is back; resuming")
             runBackoffUntil = .distantPast
             due = true
@@ -386,10 +430,93 @@ final class SyncEngine: ObservableObject {
         startSync()
     }
 
-    // MARK: Sleep / wake / drives
+    // MARK: Sleep / wake / drives / termination
     private func systemWillSleep() {
         sleepPause = true      // the run stops after the current item instead of fighting the sleep
         if isSyncing { log.info("System going to sleep; sync will pause after the current item") }
+    }
+
+    private func systemWillPowerOff() {
+        guard !isTerminating else { return }
+        isTerminating = true
+        if isSyncing {
+            needsResume = true
+            store.save()
+            log.info("System shutting down or restarting; stopping sync cleanly")
+        }
+    }
+
+    var hasActiveWork: Bool { isSyncing || activeTask != nil }
+
+    func flushForTermination() {
+        isTerminating = true
+        schedulerTask?.cancel()
+        clockTask?.cancel()
+        store.save()
+        instanceLock.release()
+    }
+
+    /// Cooperatively stops any in-flight sync/delete run, saves the ledger, and closes backends
+    /// (disconnecting SFTP and unmounting private SMB shares) within a short bounded deadline.
+    func prepareForTermination() async {
+        isTerminating = true
+        schedulerTask?.cancel()
+        clockTask?.cancel()
+
+        if !isSyncing, activeTask == nil {
+            store.save()
+            instanceLock.release()
+            return
+        }
+
+        needsResume = true
+        store.save()
+        log.info("Shutting down; finishing current operation and closing connections…")
+
+        if let task = activeTask {
+            let finishedGracefully = await Self.waitForTask(task, timeout: 2.5)
+            if !finishedGracefully {
+                task.cancel()
+                _ = await Self.waitForTask(task, timeout: 1.5)
+            }
+        }
+
+        store.save()
+        let leftover = active
+        active = []
+        if !leftover.isEmpty {
+            _ = await Self.withDeadline(1.5) {
+                for rt in leftover { await rt.backend.close() }
+            }
+        }
+        instanceLock.release()
+    }
+
+    nonisolated private static func waitForTask(_ task: Task<Void, Never>, timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let dog = Watchdog()
+            Task.detached {
+                await task.value
+                if dog.finish() { cont.resume(returning: true) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                if dog.finish() { cont.resume(returning: false) }
+            }
+        }
+    }
+
+    nonisolated private static func withDeadline(_ timeout: TimeInterval,
+                                                 _ op: @escaping @Sendable () async -> Void) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let dog = Watchdog()
+            Task {
+                await op()
+                if dog.finish() { cont.resume(returning: true) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                if dog.finish() { cont.resume(returning: false) }
+            }
+        }
     }
 
     private func systemDidWake() {
@@ -400,7 +527,7 @@ final class SyncEngine: ObservableObject {
             guard let self else { return }
             self.sleepPause = false
             self.runBackoffUntil = .distantPast        // a pre-sleep backoff no longer applies
-            self.tick()
+            await self.tick()
         }
     }
 
@@ -410,7 +537,7 @@ final class SyncEngine: ObservableObject {
             guard waitingForDestination || hasWaiting else { return }
             Task { [weak self] in                       // let the volume finish mounting
                 try? await Task.sleep(for: .seconds(3))
-                self?.tick()
+                await self?.tick()
             }
         } else if let vol = volume {
             for d in enabledDestinations where d.kind == .folder {
@@ -612,16 +739,18 @@ final class SyncEngine: ObservableObject {
         return url
     }
 
-    /// Cheap, synchronous guess used only to decide whether a retry is worth attempting.
-    private func maybeReachable(_ d: Destination) -> Bool {
-        guard d.kind == .folder else { return true }                // SFTP: just try (network permitting)
+    /// Non-blocking reachability check used only to decide whether a retry is worth attempting.
+    private func maybeReachable(_ d: Destination) async -> Bool {
+        guard d.kind == .folder else { return true }                // SFTP / SMB: just try (network permitting)
         guard let url = folderURL(d) else { return false }
-        let started = url.startAccessingSecurityScopedResource()
-        defer { if started { url.stopAccessingSecurityScopedResource() } }
-        return (try? url.checkResourceIsReachable()) == true
+        return ((try? await BlockingIO.run(timeout: 5) {
+            let started = url.startAccessingSecurityScopedResource()
+            defer { if started { url.stopAccessingSecurityScopedResource() } }
+            return (try? url.checkResourceIsReachable()) == true
+        }) ?? false)
     }
 
-    private func makeBackend(_ d: Destination) throws -> DestinationBackend {
+    private func makeBackend(_ d: Destination, allowCreateBase: Bool = true) throws -> DestinationBackend {
         switch d.kind {
         case .folder:
             guard let data = d.bookmark else {
@@ -645,20 +774,37 @@ final class SyncEngine: ObservableObject {
                 throw SyncError.message("The folder reference is no longer valid. Remove this destination and add it again.")
             }
         case .sftp:
-            guard let pw = Keychain.password(account: d.key) else {
+            let pw: String
+            switch Keychain.lookupPassword(account: d.key) {
+            case .success(let p): pw = p
+            case .locked(let status):
+                throw SyncError.destinationUnavailable("Keychain is locked (error \(status)); waiting for unlock")
+            case .notFound:
                 throw SyncError.message("The SFTP password is missing from the Keychain. Remove this destination and add it again.")
+            case .failure(let status):
+                throw SyncError.message("Could not read the SFTP password from the Keychain (error \(status)).")
             }
             let key = d.key
-            return SFTPBackend(dest: d, password: pw) { [weak self] hostKey in
+            return SFTPBackend(dest: d, password: pw, allowCreateBase: allowCreateBase) { [weak self] hostKey in
                 Task { @MainActor [weak self] in self?.pinHostKey(key, hostKey) }
             }
         case .smb:
             let guest = d.guest == true
-            let pw = guest ? nil : Keychain.password(account: d.key)
-            if !guest, pw == nil {
-                throw SyncError.message("The SMB password is missing from the Keychain. Remove this destination and add it again.")
+            let pw: String?
+            if guest {
+                pw = nil
+            } else {
+                switch Keychain.lookupPassword(account: d.key) {
+                case .success(let p): pw = p
+                case .locked(let status):
+                    throw SyncError.destinationUnavailable("Keychain is locked (error \(status)); waiting for unlock")
+                case .notFound:
+                    throw SyncError.message("The SMB password is missing from the Keychain. Remove this destination and add it again.")
+                case .failure(let status):
+                    throw SyncError.message("Could not read the SMB password from the Keychain (error \(status)).")
+                }
             }
-            return SMBBackend(dest: d, password: pw)
+            return SMBBackend(dest: d, password: pw, allowCreateBase: allowCreateBase)
         }
     }
 
@@ -731,7 +877,7 @@ final class SyncEngine: ObservableObject {
 
     /// Manually verifies every queued item across all enabled destinations and prompts macOS to delete them.
     func deleteQueuedNow() {
-        guard !isSyncing else { lastError = "A sync is running. Try again when it finishes."; return }
+        guard !isSyncing, !isTerminating else { lastError = "A sync is running. Try again when it finishes."; return }
         guard !store.pendingDelete.isEmpty else { return }
         let enabled = enabledDestinations
         guard !enabled.isEmpty else {
@@ -745,20 +891,25 @@ final class SyncEngine: ObservableObject {
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Deleting synced photos from iCloud")
 
-        Task {
+        activeTask = Task {
             do {
                 try await ensurePhotosAccess(requestIfNeeded: true)
                 var rts: [DestRuntime] = []
                 for d in enabled {
+                    if isTerminating || Task.isCancelled { break }
                     var backend: DestinationBackend?
                     do {
-                        let b = try makeBackend(d)
+                        let b = try makeBackend(d, allowCreateBase: false)
                         backend = b
                         setDestStatus(d, "Connecting…")
                         try await b.connect()
                         let files = try await b.list()
                         rts.append(DestRuntime(dest: d, backend: b, listing: files))
                         setDestStatus(d, "Connected · \(files.count) files")
+                    } catch SyncError.destinationUnavailable(let m) {
+                        if let backend { await backend.close() }
+                        setDestStatus(d, "Waiting: \(m)")
+                        log.warning("\(d.name): \(m)")
                     } catch {
                         if let backend { await backend.close() }
                         setDestStatus(d, "Error: \(error.localizedDescription)")
@@ -766,15 +917,17 @@ final class SyncEngine: ObservableObject {
                     }
                 }
                 active = rts
-                if rts.count == enabled.count {
-                    deleteRetryAt = .distantPast
-                    await processDeleteQueue(manual: true)
-                    await updatePendingDeleteBytes()
-                    store.save()
-                    surfaceSaveError()
-                    for rt in rts where !rt.unavailable { setDestStatus(rt.dest, "Up to date") }
-                } else {
-                    lastError = "Cannot delete from iCloud yet: every enabled destination must be online so copies can be verified."
+                if !isTerminating, !Task.isCancelled {
+                    if rts.count == enabled.count {
+                        deleteRetryAt = .distantPast
+                        await processDeleteQueue(manual: true)
+                        await updatePendingDeleteBytes()
+                        store.save()
+                        surfaceSaveError()
+                        for rt in rts where !rt.unavailable { setDestStatus(rt.dest, "Up to date") }
+                    } else {
+                        lastError = "Cannot delete from iCloud yet: every enabled destination must be online so copies can be verified."
+                    }
                 }
             } catch {
                 lastError = error.localizedDescription
@@ -786,6 +939,101 @@ final class SyncEngine: ObservableObject {
             ProcessInfo.processInfo.endActivity(activity)
             isSyncing = false
             phase = nil
+            activeTask = nil
+            refreshCounts()
+        }
+    }
+
+    /// Re-reads and checksum-verifies every recorded file across all enabled destinations on demand.
+    func verifyDestinationsNow() {
+        guard !isSyncing, !isTerminating else { lastError = "A sync is running. Try again when it finishes."; return }
+        let enabled = enabledDestinations
+        guard !enabled.isEmpty else {
+            lastError = "No destination is enabled. Add or enable one in Settings › Destinations."
+            return
+        }
+        isSyncing = true
+        phase = "Connecting to destinations for verification…"
+        lastError = nil
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Verifying destination files")
+
+        activeTask = Task {
+            var checked = 0
+            var damaged = 0
+            var rts: [DestRuntime] = []
+            for d in enabled {
+                if isTerminating || Task.isCancelled { break }
+                var backend: DestinationBackend?
+                do {
+                    let b = try makeBackend(d, allowCreateBase: false)
+                    backend = b
+                    setDestStatus(d, "Connecting…")
+                    try await b.connect()
+                    let files = try await b.list()
+                    rts.append(DestRuntime(dest: d, backend: b, listing: files))
+                    setDestStatus(d, "Connected · \(files.count) files")
+                } catch SyncError.destinationUnavailable(let m) {
+                    if let backend { await backend.close() }
+                    setDestStatus(d, "Waiting: \(m)")
+                    log.warning("\(d.name): \(m)")
+                } catch {
+                    if let backend { await backend.close() }
+                    setDestStatus(d, "Error: \(error.localizedDescription)")
+                    log.error("\(d.name): \(ErrorInfo.describe(error))")
+                }
+            }
+            active = rts
+
+            for rt in rts where !rt.unavailable {
+                let items = store.allPlacements(dest: rt.key)
+                for (i, item) in items.enumerated() {
+                    if isPaused || sleepPause || isTerminating || Task.isCancelled { break }
+                    phase = "Verifying \(rt.name) (\(i + 1)/\(items.count))…"
+                    let k = FileNames.key(item.name)
+                    guard rt.names.contains(k) else {
+                        store.dropPlacements(dest: rt.key, hashes: [item.hash])
+                        damaged += 1
+                        log.warning("\(rt.name): \(item.name) is missing; queued for restore")
+                        continue
+                    }
+                    do {
+                        let actual = try await rt.backend.hash(of: rt.actualNames[k] ?? item.name, noCache: true)
+                        checked += 1
+                        if actual != item.hash {
+                            store.dropPlacements(dest: rt.key, hashes: [item.hash])
+                            damaged += 1
+                            log.error("\(rt.name): \(item.name) failed checksum verification; queued for restore")
+                        }
+                    } catch SyncError.destinationUnavailable(let m) {
+                        markUnavailable(rt, m)
+                        break
+                    } catch {
+                        damaged += 1
+                        store.dropPlacements(dest: rt.key, hashes: [item.hash])
+                        log.error("\(rt.name): could not read \(item.name) (\(error.localizedDescription)); queued for restore")
+                    }
+                }
+                if !rt.unavailable { setDestStatus(rt.dest, "Verified · \(checked) OK") }
+            }
+
+            if damaged > 0 {
+                needsResume = true
+                store.save()
+                surfaceSaveError()
+                log.warning("Destination verification finished: \(checked) intact, \(damaged) missing or corrupted (will restore on next sync)")
+                lastError = "\(damaged) file(s) were missing or corrupted and will be restored automatically."
+            } else if !rts.isEmpty {
+                log.info("Destination verification finished: all \(checked) file(s) passed uncached SHA-256 verification")
+            }
+
+            let finished = active
+            active = []
+            for rt in finished { await rt.backend.close() }
+            ProcessInfo.processInfo.endActivity(activity)
+            isSyncing = false
+            phase = nil
+            activeTask = nil
             refreshCounts()
         }
     }
@@ -853,7 +1101,7 @@ final class SyncEngine: ObservableObject {
     }
 
     private func pauseCheck() throws {
-        guard isPaused || sleepPause else { return }
+        guard isPaused || sleepPause || isTerminating || Task.isCancelled else { return }
         store.save()
         refreshCounts()
         throw SyncError.paused
@@ -915,7 +1163,7 @@ final class SyncEngine: ObservableObject {
     }
 
     private func startSync(includeBackedOff: Bool = false) {
-        guard !isSyncing, !enabledDestinations.isEmpty else { return }
+        guard !isSyncing, !isTerminating, !enabledDestinations.isEmpty else { return }
         isSyncing = true; done = 0; total = 0; phase = nil; lastError = nil; needsPhotosSettings = false
         needsAutomationSettings = false; photosFallbackFailures = 0; previewsSaved = 0
         let force = defaults.bool(forKey: "forceReconcile")
@@ -923,7 +1171,7 @@ final class SyncEngine: ObservableObject {
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Syncing photos")
 
-        Task {
+        activeTask = Task {
             do {
                 try await run(includeBackedOff: includeBackedOff, forceReconcile: force)
                 lastSync = Date()
@@ -932,8 +1180,11 @@ final class SyncEngine: ObservableObject {
             } catch SyncError.paused {
                 lastError = nil
                 needsResume = true
-                log.info(isPaused ? "Sync paused (\(done)/\(total) processed this run)"
-                                  : "Sync interrupted by sleep (\(done)/\(total) processed); will resume after wake")
+                let msg = isTerminating
+                    ? "Sync stopped for app quit/restart (\(done)/\(total) processed); will resume on next launch"
+                    : (isPaused ? "Sync paused (\(done)/\(total) processed this run)"
+                                : "Sync interrupted by sleep (\(done)/\(total) processed); will resume after wake")
+                log.info(msg)
             } catch SyncError.destinationUnavailable(let m) {
                 lastError = nil
                 needsResume = true                      // keep the unfinished work due
@@ -943,6 +1194,7 @@ final class SyncEngine: ObservableObject {
                 log.error("Run failed: \(error.localizedDescription)")
                 if case SyncError.permission = error { needsPhotosSettings = true }
                 if case SyncError.diskFull = error { runBackoffUntil = Date().addingTimeInterval(3600) }
+                else if case SyncError.localDiskFull = error { runBackoffUntil = Date().addingTimeInterval(3600) }
                 else { runBackoffUntil = Date().addingTimeInterval(15 * 60) }  // don't spin
             }
             let finished = active
@@ -951,6 +1203,7 @@ final class SyncEngine: ObservableObject {
             ProcessInfo.processInfo.endActivity(activity)
             isSyncing = false
             phase = nil
+            activeTask = nil
             refreshCounts()
         }
     }
@@ -984,6 +1237,13 @@ final class SyncEngine: ObservableObject {
         if let e = store.saveError { lastError = "Could not save sync ledger: \(e)" }
     }
 
+    private func saveLedgerOrThrow() throws {
+        if !store.save() {
+            surfaceSaveError()
+            throw SyncError.message("Could not save sync ledger: \(store.saveError ?? "disk write failed")")
+        }
+    }
+
     // MARK: Run
     private func markUnavailable(_ rt: DestRuntime, _ message: String) {
         guard !rt.unavailable else { return }
@@ -1005,9 +1265,14 @@ final class SyncEngine: ObservableObject {
         var rts: [DestRuntime] = []
         var hardError: Error?
         for d in enabled {
+            if isPaused || sleepPause || isTerminating || Task.isCancelled {
+                for rt in rts { await rt.backend.close() }
+                try pauseCheck()
+            }
             var backend: DestinationBackend?
             do {
-                let b = try makeBackend(d)
+                let allowCreate = forceReconcile || store.placementCount(d.key) == 0
+                let b = try makeBackend(d, allowCreateBase: allowCreate)
                 backend = b
                 setDestStatus(d, "Connecting…")
                 try await b.connect()
@@ -1031,30 +1296,70 @@ final class SyncEngine: ObservableObject {
         // 2. Self-heal local state.
         cleanStaging()
         for rt in rts { await rt.backend.cleanup() }
-        if store.needsRebuild { await rebuildIndex(rts) }
+        if store.needsRebuild {
+            await rebuildIndex(rts)
+            try pauseCheck()
+        }
 
-        // A destination that suddenly lost many files may be unplugged/emptied: don't touch the ledger for it.
+        // A destination that suddenly lost many files or its identity marker may be unplugged/emptied: don't touch the ledger for it.
         var blocked = false
         for rt in rts {
-            let r = store.missingPlacements(dest: rt.key, existing: rt.names)
+            do {
+                if let marker = try await rt.backend.readCanary() {
+                    if marker != rt.key {
+                        rt.unavailable = true
+                        let msg = "Folder identity marker belongs to a different destination – check mounted volumes."
+                        setDestStatus(rt.dest, "Error: \(msg)")
+                        log.error("\(rt.name): \(msg)")
+                        continue
+                    }
+                    if !store.hasCanary(rt.key) { store.markCanaryWritten(rt.key) }
+                } else if !forceReconcile, store.hasCanary(rt.key), store.placementCount(rt.key) > 0, rt.names.isEmpty {
+                    blocked = true
+                    rt.unavailable = true
+                    let msg = "Destination folder is empty and its identity marker is missing – the backing volume may be unmounted. Nothing was changed."
+                    setDestStatus(rt.dest, "Error: \(msg)")
+                    log.error("\(rt.name): \(msg)")
+                    continue
+                }
+            } catch SyncError.destinationUnavailable(let m) {
+                markUnavailable(rt, m)
+                continue
+            } catch {
+                log.warning("\(rt.name): could not read destination marker: \(error.localizedDescription)")
+            }
+
+            let r = store.missingPlacements(dest: rt.key, existing: rt.names, sizes: rt.sizes)
             if !forceReconcile, r.total >= 5, Double(r.missing.count) > Double(r.total) * 0.2 {
                 blocked = true
                 rt.unavailable = true
-                let msg = "\(r.missing.count) of \(r.total) synced files are missing – it may be unavailable or was emptied. Nothing was changed."
+                let msg = "\(r.missing.count) of \(r.total) synced files are missing or damaged – it may be unavailable or was emptied. Nothing was changed."
                 setDestStatus(rt.dest, "Error: \(msg)")
                 log.error("\(rt.name): \(msg)")
                 continue
             }
+            for zk in r.zeroByteKeys {
+                if let actual = rt.actualNames[zk] {
+                    try? await rt.backend.delete(name: actual)
+                    rt.removeFile(name: actual)
+                    log.warning("\(rt.name): removed 0-byte truncated file \(actual); will restore")
+                }
+            }
             store.dropPlacements(dest: rt.key, hashes: r.missing)
             if !r.missing.isEmpty {
-                log.warning("\(rt.name): \(r.missing.count) previously synced file(s) are gone; they will be restored")
+                log.warning("\(rt.name): \(r.missing.count) previously synced file(s) are missing or truncated; they will be restored")
+            }
+            if !store.hasCanary(rt.key) || forceReconcile {
+                if (try? await rt.backend.writeCanary(rt.key)) != nil {
+                    store.markCanaryWritten(rt.key)
+                }
             }
         }
         needsConfirmReconcile = blocked
         if forceReconcile { defaults.set(false, forKey: "forceReconcile") }
-        store.save()
+        try saveLedgerOrThrow()
         guard rts.contains(where: { !$0.unavailable }) else {
-            throw SyncError.message("Every reachable destination looks emptied. Check them, or choose “Re-sync Missing Files”.")
+            throw SyncError.message("Every reachable destination looks emptied or unavailable. Check them, or choose “Re-sync Missing Files”.")
         }
 
         await purgeRetiredPreviews()
@@ -1065,8 +1370,9 @@ final class SyncEngine: ObservableObject {
         // 4. Scan the library off the main thread.
         phase = "Checking for new photos…"
         let known = store.completeIDs(for: rts.filter { !$0.unavailable }.map(\.key))
+        let modDates = store.syncedModifiedDates
         let skip = includeBackedOff ? store.parkedIDs : store.backedOffIDs()      // parked items only ever retry manually
-        let scan = await Task.detached { Self.scanLibrary(known: known, skip: skip) }.value
+        let scan = await Task.detached { Self.scanLibrary(known: known, modifiedDates: modDates, skip: skip) }.value
         store.pruneFailures(keeping: scan.live)
         phase = nil
         total = scan.pending.count
@@ -1104,8 +1410,7 @@ final class SyncEngine: ObservableObject {
                     }
                 }
                 await purgeRetiredPreviews()
-                store.save()
-                surfaceSaveError()
+                try saveLedgerOrThrow()
                 refreshCounts()
             }
         }
@@ -1133,12 +1438,13 @@ final class SyncEngine: ObservableObject {
         // 6. Bring destinations level again (a destination that failed mid-item catches up from the others).
         try await mirror(rts)
         await purgeRetiredPreviews()
+        await scrubSample(rts)
 
         // 7. Delete from iCloud (verified on EVERY destination, persisted queue).
         try pauseCheck()
         if deleteAfter {
             await planDeletions(syncedThisRun: syncedIDs)
-            store.save()
+            try saveLedgerOrThrow()
             refreshCounts()
             try pauseCheck()
             if shouldAutoProcessDeletions {
@@ -1155,8 +1461,7 @@ final class SyncEngine: ObservableObject {
                 }
             }
         }
-        store.save()
-        surfaceSaveError()
+        try saveLedgerOrThrow()
         for rt in rts where !rt.unavailable { setDestStatus(rt.dest, "Up to date") }
         if previewsSaved > 0 { log.info("Saved \(previewsSaved) preview(s) of photos whose originals aren't available yet") }
         let summary = "Sync finished: \(syncedCount) synced, \(failedThisRun) failed, \(cloudThisRun) waiting for iCloud, \(store.failureCount + store.cloudWaitingCount) total awaiting retry"
@@ -1180,14 +1485,22 @@ final class SyncEngine: ObservableObject {
         return ids
     }
 
-    nonisolated private static func scanLibrary(known: Set<String>, skip: Set<String>)
+    nonisolated private static func scanLibrary(known: Set<String>, modifiedDates: [String: Date], skip: Set<String>)
         -> (pending: [String], live: Set<String>) {
         var pending: [String] = []
         var live = Set<String>()
         PHAsset.fetchAssets(with: libraryFetchOptions()).enumerateObjects { a, _, _ in
-            live.insert(a.localIdentifier)
-            if !known.contains(a.localIdentifier) && !skip.contains(a.localIdentifier) {
-                pending.append(a.localIdentifier)
+            let id = a.localIdentifier
+            live.insert(id)
+            guard !skip.contains(id) else { return }
+            if !known.contains(id) {
+                pending.append(id)
+            } else if let syncedMod = modifiedDates[id] {
+                if syncedMod == .distantPast {
+                    pending.append(id)
+                } else if let curMod = a.modificationDate, curMod.timeIntervalSince(syncedMod) > 1.0 {
+                    pending.append(id)
+                }
             }
         }
         return (pending, live)
@@ -1218,17 +1531,79 @@ final class SyncEngine: ObservableObject {
         try? FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
     }
 
+    nonisolated private static func localFreeSpace(at dir: URL) -> Int64? {
+        if let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage, free > 0 {
+            return free
+        }
+        if let free = (try? FileManager.default.attributesOfFileSystem(forPath: dir.path)[.systemFreeSize] as? NSNumber)?
+            .int64Value, free > 0 {
+            return free
+        }
+        return nil
+    }
+
+    private func ensureLocalSpace(needed: Int64) throws {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let stagingParent = stagingDir.deletingLastPathComponent()
+        let required = max(needed, 0) + Self.localReserveBytes
+        for dir in [appSupport, stagingParent] {
+            if let free = Self.localFreeSpace(at: dir), free < required {
+                throw SyncError.localDiskFull
+            }
+        }
+    }
+
+    /// Verifies a small rolling slice (up to 3 files per local/SMB destination per run) with `F_NOCACHE`
+    /// to catch silent media corruption early.
+    private func scrubSample(_ rts: [DestRuntime]) async {
+        var droppedAny = false
+        for rt in rts where !rt.unavailable && rt.dest.kind != .sftp {
+            let offset = scrubOffsets[rt.key] ?? 0
+            let (slice, next) = store.placementSlice(dest: rt.key, offset: offset, count: 3)
+            guard !slice.isEmpty else { continue }
+            scrubOffsets[rt.key] = next
+            for item in slice {
+                if isPaused || sleepPause || isTerminating || Task.isCancelled { return }
+                let k = FileNames.key(item.name)
+                guard rt.names.contains(k) else { continue }
+                do {
+                    let actual = try await rt.backend.hash(of: rt.actualNames[k] ?? item.name, noCache: true)
+                    if actual != item.hash {
+                        store.dropPlacements(dest: rt.key, hashes: [item.hash])
+                        droppedAny = true
+                        log.error("Integrity check failed for \(item.name) at \(rt.name) (checksum mismatch); queued for restore")
+                    }
+                } catch SyncError.destinationUnavailable(let m) {
+                    markUnavailable(rt, m)
+                    break
+                } catch {
+                    log.warning("Could not verify \(item.name) at \(rt.name): \(error.localizedDescription)")
+                }
+            }
+        }
+        if droppedAny { store.save() }
+    }
+
     /// After a corrupt ledger: learn what's already in each destination so nothing is duplicated.
     private func rebuildIndex(_ rts: [DestRuntime]) async {
         for rt in rts where !rt.unavailable {
+            let alreadyKnown = store.knownNames(rt.key)
             var n = 0
             for f in rt.listing {
+                if isPaused || sleepPause || isTerminating || Task.isCancelled {
+                    store.save()
+                    phase = nil
+                    return
+                }
                 n += 1
+                if alreadyKnown.contains(FileNames.key(f.name)) { continue }
                 phase = "Rebuilding index: \(rt.name) (\(n)/\(rt.listing.count))…"
                 if let h = try? await rt.backend.hash(of: f.name, noCache: false) {
-                    if store.placement(rt.key, hash: h) == nil { store.addPlacement(rt.key, hash: h, name: f.name) }
+                    if store.placement(rt.key, hash: h) == nil { store.addPlacement(rt.key, hash: h, name: f.name, size: f.size) }
                     else { store.addKnownName(rt.key, f.name) }
                 }
+                if n % 10 == 0 { store.save() }
             }
         }
         store.needsRebuild = false
@@ -1256,7 +1631,7 @@ final class SyncEngine: ObservableObject {
                 phase = "Indexing \(rt.name) (\(i + 1)/\(unknown.count))…"
                 do {
                     let h = try await rt.backend.hash(of: f.name, noCache: false)
-                    if store.placement(rt.key, hash: h) == nil { store.addPlacement(rt.key, hash: h, name: f.name) }
+                    if store.placement(rt.key, hash: h) == nil { store.addPlacement(rt.key, hash: h, name: f.name, size: f.size) }
                     else { store.addKnownName(rt.key, f.name) }       // same content under another name: leave it alone
                 } catch SyncError.destinationUnavailable(let m) {
                     markUnavailable(rt, m); break
@@ -1313,6 +1688,8 @@ final class SyncEngine: ObservableObject {
     /// Download from `src`, prove the bytes still match their checksum (catches a corrupted source),
     /// then upload with the same verification as any other copy.
     private func copyBetween(_ src: DestRuntime, _ dst: DestRuntime, name: String, hash: String) async throws {
+        let expected = Int64(store.expectedSize(hash) ?? 50_000_000)
+        try ensureLocalSpace(needed: expected)
         try? FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
         let staged = stagingDir.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: staged) }
@@ -1324,11 +1701,14 @@ final class SyncEngine: ObservableObject {
         guard try await FileHash.sha256(of: staged) == hash else {
             throw SyncError.message("\(name) in \(src.name) no longer matches its checksum (corrupted or modified)")
         }
-        let target = uniqueName(name, stamp: Int(date?.timeIntervalSince1970 ?? 0), in: dst)
-        try await dst.backend.upload(local: staged, as: target, size: size, hash: hash, date: date)
-        store.addPlacement(dst.key, hash: hash, name: target)
-        dst.names.insert(FileNames.key(target))
-        dst.sizes[FileNames.key(target)] = size
+        let resolved = try await resolveTargetName(
+            name, stamp: Int(date?.timeIntervalSince1970 ?? 0),
+            size: size, hash: hash, in: dst)
+        if !resolved.alreadyPresent {
+            try await dst.backend.upload(local: staged, as: resolved.name, size: size, hash: hash, date: date)
+            dst.recordFile(name: resolved.name, size: size)
+        }
+        store.addPlacement(dst.key, hash: hash, name: resolved.name, size: size)
     }
 
     // MARK: Export
@@ -1339,21 +1719,26 @@ final class SyncEngine: ObservableObject {
             || (e.domain == NSPOSIXErrorDomain && e.code == Int(ENOSPC))
     }
 
-    /// Up to 3 attempts (2s, 4s backoff). Only destinations still missing the asset are retried.
+    /// Up to 3 attempts (2s, 4s backoff). Only destinations still missing the asset (or needing an edit refresh) are retried.
     private func exportWithRetry(id: String, asset: PHAsset) async throws {
         var lastErr: Error = SyncError.message("Unknown error")
         for attempt in 1...3 {
-            let targets = active.filter { !$0.unavailable && !store.isComplete(id, dest: $0.key) }
+            try pauseCheck()
+            let editRefresh = store.needsEditRefresh(id, modifiedAt: asset.modificationDate)
+            let targets = active.filter { !$0.unavailable && (editRefresh || !store.isComplete(id, dest: $0.key)) }
             if targets.isEmpty {
                 if store.entry(id) != nil { return }                           // finished on every reachable destination
                 throw SyncError.destinationUnavailable("All destinations became unavailable")
             }
             do { try await export(id: id, asset: asset, targets: targets); return }
+            catch SyncError.paused { throw SyncError.paused }
             catch SyncError.diskFull { throw SyncError.diskFull }
+            catch SyncError.localDiskFull { throw SyncError.localDiskFull }
             catch {
                 if case SyncError.cloudOnly = error { throw error }       // retrying won't help
                 if case SyncError.destinationUnavailable = error { throw error }
                 if Self.isDiskFull(error) { throw SyncError.diskFull }
+                try pauseCheck()
                 lastErr = error
                 if attempt < 3 { try? await Task.sleep(for: .seconds(Double(1 << attempt))) }
             }
@@ -1383,16 +1768,28 @@ final class SyncEngine: ObservableObject {
             throw SyncError.message("No original resource available (only \(primary.type.rawValue) found); will retry")
         }
         let hasEdits = plan.contains { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo }
+
+        // Metadata-only modificationDate bump (e.g. Favorited or album change) on an unedited item:
+        // update the recorded timestamp without re-downloading originals from iCloud.
+        if let existing = store.entry(id), existing.verified, !hasEdits,
+           Set(plan.map { $0.type.rawValue }) == Set(existing.parts.map(\.type)),
+           targets.allSatisfy({ store.isComplete(id, dest: $0.key) }) {
+            store.updateModifiedAt(id: id, modifiedAt: asset.modificationDate)
+            return
+        }
+
         if hasEdits { log.info("\(primary.originalFilename) has edits: saving the original plus an '-edited' copy") }
 
         // Photos IDs can change (library restore, new Mac). If this exact item is already at every
         // target, skip the download – but never auto-delete it, since it isn't hash-verified.
         let fp = Self.fingerprint(asset, primary)
-        if let parts = store.fingerprint(fp), targets.allSatisfy({ store.hasAll(parts, dest: $0.key) }) {
+        if !hasEdits, let parts = store.fingerprint(fp), targets.allSatisfy({ store.hasAll(parts, dest: $0.key) }) {
             recordDuplicate("Duplicate skipped: \(primary.originalFilename) is already in the destination(s) (Photos ID changed)")
-            store.recordSynced(id: id, entry: Entry(parts: parts, verified: false), fingerprint: nil)
+            store.recordSynced(id: id, entry: Entry(parts: parts, verified: false, modifiedAt: asset.modificationDate), fingerprint: nil)
             return
         }
+
+        try ensureLocalSpace(needed: Self.estimatedBytes(asset))
 
         // Destinations that can't hold this asset are skipped for it (and reported), not run-fatal.
         var failed: [(DestRuntime, Error)] = []
@@ -1410,9 +1807,24 @@ final class SyncEngine: ObservableObject {
         let base = (primary.originalFilename as NSString).deletingPathExtension
         var parts: [Part] = []
         for (i, res) in plan.enumerated() {
+            try pauseCheck()
+            // Immutable original parts already placed on every target need not be re-downloaded when syncing new edits.
+            let isImmutableOriginal = (res.type == .photo || res.type == .video
+                || res.type == .alternatePhoto || res.type == .pairedVideo)
+            if isImmutableOriginal,
+               let existing = store.entry(id), existing.verified,
+               let prevPart = existing.parts.first(where: { $0.type == res.type.rawValue }),
+               remaining.allSatisfy({ rt in
+                   guard let placedName = store.placement(rt.key, hash: prevPart.hash) else { return false }
+                   return rt.names.contains(FileNames.key(placedName))
+               }) {
+                parts.append(prevPart)
+                continue
+            }
+
             let staged = try await stageResource(res, asset: asset, isPrimary: i == 0, hasEdits: hasEdits, exportFolder: exportFolder)
             defer { try? FileManager.default.removeItem(at: staged.url) }
-            parts.append(Part(hash: staged.hash, type: res.type.rawValue))
+            parts.append(Part(hash: staged.hash, type: res.type.rawValue, size: staged.size))
             for rt in remaining where !rt.unavailable {
                 do {
                     try await place(staged, res: res, asset: asset, primaryBase: base, isPrimary: i == 0, on: rt)
@@ -1431,7 +1843,7 @@ final class SyncEngine: ObservableObject {
             throw SyncError.destinationUnavailable("Destination became unavailable during sync")
         }
         // Record what was learned even if some destinations failed: they retry on their own.
-        store.recordSynced(id: id, entry: Entry(parts: parts, verified: true), fingerprint: fp)
+        store.recordSynced(id: id, entry: Entry(parts: parts, verified: true, modifiedAt: asset.modificationDate), fingerprint: fp)
         if !failed.isEmpty {
             if failed.count == targets.count && failed.allSatisfy({ Self.isDiskFull($0.1) }) { throw SyncError.diskFull }
             throw SyncError.message(failed.map { "\($0.0.name): \($0.1.localizedDescription)" }.joined(separator: "; "))
@@ -1499,8 +1911,10 @@ final class SyncEngine: ObservableObject {
         guard let size = FileHash.size(of: staged), size > 0 else {
             throw SyncError.message("Downloaded file is empty")
         }
-        if isPrimary && asset.mediaType == .image {
-            try Self.verifyOriginalImage(staged, resource: res, asset: asset, hasEdits: hasEdits)
+        if res.contentType.conforms(to: .image) || (isPrimary && asset.mediaType == .image) {
+            try Self.verifyImage(staged, resource: res, asset: asset, isPrimary: isPrimary, hasEdits: hasEdits)
+        } else if res.contentType.conforms(to: .audiovisualContent) || (isPrimary && asset.mediaType == .video) {
+            try await Self.verifyVideo(staged, asset: asset, isPrimary: isPrimary, hasEdits: hasEdits)
         }
         let hash = try await FileHash.sha256(of: staged)          // checksum of the true original
         success = true
@@ -1519,29 +1933,33 @@ final class SyncEngine: ObservableObject {
             }
             return
         }
-        let name = uniqueName(Self.targetName(res, primaryBase: primaryBase, isPrimary: isPrimary),
-                              stamp: Int(asset.creationDate?.timeIntervalSince1970 ?? 0), in: rt)
-        try await rt.backend.upload(local: staged.url, as: name, size: staged.size, hash: staged.hash, date: asset.creationDate)
-        store.addPlacement(rt.key, hash: staged.hash, name: name)
-        rt.names.insert(FileNames.key(name))
-        rt.sizes[FileNames.key(name)] = staged.size
+        let preferred = Self.targetName(res, primaryBase: primaryBase, isPrimary: isPrimary)
+        let resolved = try await resolveTargetName(
+            preferred, stamp: Int(asset.creationDate?.timeIntervalSince1970 ?? 0),
+            size: staged.size, hash: staged.hash, in: rt)
+        if !resolved.alreadyPresent {
+            try await rt.backend.upload(local: staged.url, as: resolved.name, size: staged.size, hash: staged.hash, date: asset.creationDate)
+            rt.recordFile(name: resolved.name, size: staged.size)
+        } else {
+            log.info("Adopted existing verified file \(resolved.name) at \(rt.name)")
+        }
+        store.addPlacement(rt.key, hash: staged.hash, name: resolved.name, size: staged.size)
         attemptHashes.insert(marker)
     }
 
-    /// Proves the staged file is the full-resolution original, not a thumbnail/optimized copy:
-    /// it must decode, match the resource's declared format, and (when unedited, so the asset's
-    /// dimensions equal the original's) match the library's pixel dimensions.
-    nonisolated private static func verifyOriginalImage(_ url: URL, resource: PHAssetResource,
-                                                        asset: PHAsset, hasEdits: Bool) throws {
+    /// Proves a staged image decodes, matches its declared format, and (when it is the primary
+    /// resource of an unedited asset) matches the library's full pixel dimensions.
+    nonisolated private static func verifyImage(_ url: URL, resource: PHAssetResource,
+                                                asset: PHAsset, isPrimary: Bool, hasEdits: Bool) throws {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetCount(src) > 0 else {
             throw SyncError.message("Exported image cannot be decoded (corrupt or incomplete)")
         }
         if let actual = CGImageSourceGetType(src).flatMap({ UTType($0 as String) }),
            let declared = UTType(resource.uniformTypeIdentifier),
            !actual.conforms(to: declared) && !declared.conforms(to: actual) {
-            throw SyncError.message("Exported format \(actual.identifier) differs from original \(declared.identifier)")
+            throw SyncError.message("Exported format \(actual.identifier) differs from declared \(declared.identifier)")
         }
-        guard !hasEdits,
+        guard isPrimary, !hasEdits,
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = props[kCGImagePropertyPixelWidth] as? Int,
               let h = props[kCGImagePropertyPixelHeight] as? Int,
@@ -1550,6 +1968,32 @@ final class SyncEngine: ObservableObject {
         let same = (w == asset.pixelWidth && h == asset.pixelHeight) || (w == asset.pixelHeight && h == asset.pixelWidth)
         if !same {
             throw SyncError.message("Exported image is \(w)×\(h) but the original is \(asset.pixelWidth)×\(asset.pixelHeight) – not full resolution")
+        }
+    }
+
+    /// Proves a staged video container is playable, carries a valid video track, and wasn't truncated.
+    nonisolated private static func verifyVideo(_ url: URL, asset: PHAsset, isPrimary: Bool, hasEdits: Bool) async throws {
+        let av = AVURLAsset(url: url)
+        let playable = (try? await av.load(.isPlayable)) ?? false
+        guard playable else {
+            throw SyncError.message("Exported video cannot be played (corrupt or truncated)")
+        }
+        let tracks = (try? await av.loadTracks(withMediaType: .video)) ?? []
+        guard let track = tracks.first else {
+            throw SyncError.message("Exported video contains no video track")
+        }
+        if let size = try? await track.load(.naturalSize), size.width <= 0 || size.height <= 0 {
+            throw SyncError.message("Exported video has invalid frame dimensions")
+        }
+        let dur = (try? await av.load(.duration)) ?? .zero
+        guard dur.isNumeric, dur.seconds > 0 else {
+            throw SyncError.message("Exported video has invalid or zero duration")
+        }
+        if isPrimary, !hasEdits, !asset.mediaSubtypes.contains(.videoHighFrameRate), asset.duration > 2.0 {
+            if dur.seconds < asset.duration * 0.8 {
+                throw SyncError.message(
+                    String(format: "Exported video is %.1f s but expected %.1f s (truncated)", dur.seconds, asset.duration))
+            }
         }
     }
 
@@ -1563,9 +2007,34 @@ final class SyncEngine: ObservableObject {
         return clean
     }
 
-    /// A name that doesn't collide (case-insensitively) with anything already in the destination.
-    private func uniqueName(_ name: String, stamp: Int, in rt: DestRuntime) -> String {
-        guard rt.names.contains(FileNames.key(name)) else { return name }
+    /// Picks a destination filename that doesn't collide (case-insensitively) with unrelated files, while
+    /// adopting an already-present byte-identical file (e.g. from an earlier run interrupted before the
+    /// ledger was saved) instead of duplicating it under a `_<stamp>` suffix.
+    private func resolveTargetName(_ name: String, stamp: Int, size: UInt64, hash: String,
+                                   in rt: DestRuntime) async throws -> (name: String, alreadyPresent: Bool) {
+        func matchesExisting(_ candidate: String) async throws -> String? {
+            let k = FileNames.key(candidate)
+            guard rt.names.contains(k) else { return nil }
+            let actual = rt.actualNames[k] ?? candidate
+            guard rt.sizes[k] == size else { return "" }            // occupied by a different file
+            do {
+                if try await rt.backend.hash(of: actual, noCache: true) == hash {
+                    return actual
+                }
+            } catch SyncError.destinationUnavailable(let m) {
+                throw SyncError.destinationUnavailable(m)
+            } catch {
+                // Unreadable foreign file under that name: treat as occupied and pick a unique suffix.
+            }
+            return ""
+        }
+
+        if let hit = try await matchesExisting(name) {
+            if !hit.isEmpty { return (hit, true) }
+        } else {
+            return (name, false)
+        }
+
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         func candidate(_ suffix: String) -> String {
@@ -1574,8 +2043,12 @@ final class SyncEngine: ObservableObject {
         }
         var result = candidate("")
         var n = 1
-        while rt.names.contains(FileNames.key(result)) { result = candidate("_\(n)"); n += 1 }
-        return result
+        while let hit = try await matchesExisting(result) {
+            if !hit.isEmpty { return (hit, true) }
+            result = candidate("_\(n)")
+            n += 1
+        }
+        return (result, false)
     }
 
     // MARK: Previews (best local version while the original is unavailable)
@@ -1611,15 +2084,18 @@ final class SyncEngine: ObservableObject {
             if let existing = store.placement(rt.key, hash: hash), rt.names.contains(FileNames.key(existing)) {
                 saved = true; continue
             }
-            let name = uniqueName(FileNames.sanitize("\(base)-preview.\(preview.ext)"),
-                                  stamp: Int(asset.creationDate?.timeIntervalSince1970 ?? 0), in: rt)
+            let preferred = FileNames.sanitize("\(base)-preview.\(preview.ext)")
             do {
-                try await rt.backend.upload(local: staged, as: name, size: size, hash: hash, date: asset.creationDate)
-                store.addPlacement(rt.key, hash: hash, name: name)
-                rt.names.insert(FileNames.key(name))
-                rt.sizes[FileNames.key(name)] = size
+                let resolved = try await resolveTargetName(
+                    preferred, stamp: Int(asset.creationDate?.timeIntervalSince1970 ?? 0),
+                    size: size, hash: hash, in: rt)
+                if !resolved.alreadyPresent {
+                    try await rt.backend.upload(local: staged, as: resolved.name, size: size, hash: hash, date: asset.creationDate)
+                    rt.recordFile(name: resolved.name, size: size)
+                    uploadedNew = true
+                }
+                store.addPlacement(rt.key, hash: hash, name: resolved.name, size: size)
                 saved = true
-                uploadedNew = true
             } catch {
                 log.warning("Could not save a preview of \(fileName) to \(rt.name): \(error.localizedDescription)")
             }
@@ -1651,8 +2127,7 @@ final class SyncEngine: ObservableObject {
                         removed += 1
                     }
                     store.dropPlacements(dest: rt.key, hashes: [hash])
-                    rt.names.remove(FileNames.key(name))
-                    rt.sizes[FileNames.key(name)] = nil
+                    rt.removeFile(name: name)
                 } catch {
                     log.warning("Could not remove preview \(name) from \(rt.name): \(error.localizedDescription)")
                 }
@@ -1681,6 +2156,9 @@ final class SyncEngine: ObservableObject {
         } catch SyncError.diskFull {
             store.save()
             throw SyncError.diskFull                                // every destination is full: stop the run
+        } catch SyncError.localDiskFull {
+            store.save()
+            throw SyncError.localDiskFull                           // startup disk is low: stop the run
         } catch SyncError.cloudOnly(let details) {
             let name = PHAssetResource.assetResources(for: asset).first?.originalFilename ?? id
             let preview = await savePreview(id: id, asset: asset, fileName: name)
@@ -1860,6 +2338,10 @@ final class SyncEngine: ObservableObject {
         var toDelete: [PHAsset] = []
         var checked = 0
         for (id, asset) in assets {
+            if isTerminating || Task.isCancelled {
+                phase = nil
+                return
+            }
             checked += 1
             phase = "Verifying copies before iCloud delete (\(checked)/\(assets.count))…"
             guard let entry = store.entry(id), entry.verified, !entry.parts.isEmpty else {
@@ -1871,9 +2353,14 @@ final class SyncEngine: ObservableObject {
                 if newest > cutoff { continue }                      // too fresh, stays queued
             }
 
+            if store.needsEditRefresh(id, modifiedAt: asset.modificationDate) {
+                continue                                            // edited since last sync: wait until new edit is synced
+            }
+
             let needed = Set(Self.exportPlan(PHAssetResource.assetResources(for: asset)).map { $0.type.rawValue })
             if !needed.isSubset(of: Set(entry.parts.map(\.type))) {
-                store.dequeueDelete([id]); continue                  // asset gained parts we never copied
+                store.markNeedsEditSync(id)                         // legacy entry gained edits: re-sync on next run
+                continue
             }
 
             // Re-read every copy from every destination (no cache) – proves the bytes are still intact.
@@ -1901,6 +2388,8 @@ final class SyncEngine: ObservableObject {
                     PHAssetChangeRequest.deleteAssets(toDelete as NSArray)
                 }
                 store.dequeueDelete(toDelete.map(\.localIdentifier))
+                store.save()
+                surfaceSaveError()
                 log.info("Deleted \(toDelete.count) item(s) from iCloud after verifying copies on \(online.count) destination(s)")
             } catch {
                 let cancelled = (error as? PHPhotosError)?.code == .userCancelled

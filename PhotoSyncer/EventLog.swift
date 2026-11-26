@@ -22,6 +22,7 @@ final class EventLog: ObservableObject {
 
     let fileURL: URL
     private let osLog = Logger(subsystem: "com.gc.PhotoSyncer", category: "app")
+    private nonisolated let writeQueue = DispatchQueue(label: "PhotoSyncer.eventlog", qos: .utility)
     private let encoder: JSONEncoder = {
         let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; return e
     }()
@@ -51,8 +52,11 @@ final class EventLog: ObservableObject {
 
     func clear() {
         events.removeAll()
-        try? FileManager.default.removeItem(at: fileURL)
-        try? FileManager.default.removeItem(at: fileURL.appendingPathExtension("1"))
+        let url = fileURL
+        writeQueue.async {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.appendingPathExtension("1"))
+        }
     }
 
     func text(errorsOnly: Bool = false) -> String {
@@ -77,18 +81,22 @@ final class EventLog: ObservableObject {
     private func persist(_ event: LogEvent) {
         guard var line = try? encoder.encode(event) else { return }
         line.append(0x0A)
-        let fm = FileManager.default
-        if let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.uint64Value,
-           size > Self.maxFileBytes {
-            let backup = fileURL.appendingPathExtension("1")
-            try? fm.removeItem(at: backup)
-            try? fm.moveItem(at: fileURL, to: backup)
-        }
-        if !fm.fileExists(atPath: fileURL.path) { fm.createFile(atPath: fileURL.path, contents: nil) }
-        if let h = try? FileHandle(forWritingTo: fileURL) {
-            defer { try? h.close() }
-            _ = try? h.seekToEnd()
-            try? h.write(contentsOf: line)
+        let url = fileURL
+        let maxBytes = Self.maxFileBytes
+        writeQueue.async {
+            let fm = FileManager.default
+            if let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value,
+               size > maxBytes {
+                let backup = url.appendingPathExtension("1")
+                try? fm.removeItem(at: backup)
+                try? fm.moveItem(at: url, to: backup)
+            }
+            if !fm.fileExists(atPath: url.path) { fm.createFile(atPath: url.path, contents: nil) }
+            if let h = try? FileHandle(forWritingTo: url) {
+                defer { try? h.close() }
+                _ = try? h.seekToEnd()
+                try? h.write(contentsOf: line)
+            }
         }
     }
 

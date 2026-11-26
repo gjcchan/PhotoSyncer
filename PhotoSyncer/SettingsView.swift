@@ -450,6 +450,13 @@ private struct MaintenanceTab: View {
 
     var body: some View {
         Form {
+            Section("Integrity") {
+                Text("Reads back every synced file from each enabled destination without using the OS file cache and checks its SHA-256 checksum against the ledger. Any missing or damaged copies are automatically queued to be restored on the next sync.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Verify Destination Files Now") { syncer.verifyDestinationsNow() }
+                    .disabled(syncer.isSyncing)
+            }
+
             Section("Reset") {
                 Text("Deletes all logs and the sync history, then re-scans your whole Photos library and rebuilds from scratch. Files already in your destination folder are not deleted. You will be asked to confirm.")
                     .font(.callout).foregroundStyle(.secondary)

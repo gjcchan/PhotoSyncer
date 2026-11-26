@@ -21,6 +21,10 @@ nonisolated protocol DestinationBackend: AnyObject, Sendable {
     func hash(of name: String, noCache: Bool) async throws -> String
     /// Removes one file we created earlier (used to replace previews with the real original).
     func delete(name: String) async throws
+    /// Reads the hidden `.photosyncer-id` destination marker if present (nil when absent).
+    func readCanary() async throws -> String?
+    /// Writes the hidden `.photosyncer-id` destination marker so unmounted/wrong volumes are caught.
+    func writeCanary(_ id: String) async throws
     func cleanup() async
     func close() async
 }
@@ -43,10 +47,13 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
             scoped = url.startAccessingSecurityScopedResource()
             guard scoped else { throw SyncError.message("Cannot access this folder. Remove it and add it again.") }
         }
-        try validate()
+        let target = url
+        try await BlockingIO.run(timeout: 30, timeoutMessage: "The destination folder stopped responding") {
+            try Self.validate(url: target)
+        }
     }
 
-    private func validate() throws {
+    private static func validate(url: URL) throws {
         do { _ = try url.checkResourceIsReachable() }
         catch { throw SyncError.destinationUnavailable("Folder is not reachable (drive unplugged or share offline?)") }
         guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
@@ -58,17 +65,27 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
         }
     }
 
-    func isAvailable() async -> Bool { (try? validate()) != nil }
+    func isAvailable() async -> Bool {
+        let target = url
+        return (try? await BlockingIO.run(timeout: 15) { try Self.validate(url: target) }) != nil
+    }
 
     func list() async throws -> [RemoteFile] {
-        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
-        let urls: [URL]
-        do { urls = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) }
-        catch { throw SyncError.destinationUnavailable("Cannot read the folder: \(error.localizedDescription)") }
-        return urls.compactMap { u in
-            let v = try? u.resourceValues(forKeys: Set(keys))
-            guard v?.isRegularFile == true else { return nil }
-            return RemoteFile(name: u.lastPathComponent, size: UInt64(v?.fileSize ?? 0))
+        let target = url
+        return try await BlockingIO.run(timeout: 60, timeoutMessage: "Listing the destination folder timed out") {
+            let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+            let urls: [URL]
+            do {
+                urls = try FileManager.default.contentsOfDirectory(
+                    at: target, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+            } catch {
+                throw SyncError.destinationUnavailable("Cannot read the folder: \(error.localizedDescription)")
+            }
+            return urls.compactMap { u in
+                let v = try? u.resourceValues(forKeys: Set(keys))
+                guard v?.isRegularFile == true else { return nil }
+                return RemoteFile(name: u.lastPathComponent, size: UInt64(v?.fileSize ?? 0))
+            }
         }
     }
 
@@ -129,6 +146,43 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
 
     func delete(name: String) async throws {
         try FileManager.default.removeItem(at: url.appendingPathComponent(name))
+    }
+
+    func readCanary() async throws -> String? {
+        let target = url.appendingPathComponent(FileNames.canaryName)
+        return try await BlockingIO.run(timeout: 15) {
+            guard FileManager.default.fileExists(atPath: target.path) else { return nil }
+            let data = try Data(contentsOf: target)
+            let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (text?.isEmpty == false) ? text : nil
+        }
+    }
+
+    func writeCanary(_ id: String) async throws {
+        let dir = url
+        try await BlockingIO.run(timeout: 15) {
+            let tmp = dir.appendingPathComponent("\(FileNames.canaryName).tmp")
+            let final = dir.appendingPathComponent(FileNames.canaryName)
+            unlink(tmp.path)
+            guard FileManager.default.createFile(atPath: tmp.path, contents: nil) else {
+                throw SyncError.message("Cannot write destination marker")
+            }
+            let h = try FileHandle(forWritingTo: tmp)
+            do {
+                try h.write(contentsOf: Data((id + "\n").utf8))
+                if fcntl(h.fileDescriptor, F_FULLFSYNC) == -1 { try? h.synchronize() }
+                try h.close()
+            } catch {
+                try? h.close()
+                unlink(tmp.path)
+                throw error
+            }
+            guard Darwin.rename(tmp.path, final.path) == 0 else {
+                let err = errno
+                unlink(tmp.path)
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))
+            }
+        }
     }
 
     func cleanup() async {

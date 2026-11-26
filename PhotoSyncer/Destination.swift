@@ -53,6 +53,13 @@ nonisolated struct Destination: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+nonisolated enum KeychainLookup: Sendable {
+    case success(String)
+    case notFound
+    case locked(OSStatus)
+    case failure(OSStatus)
+}
+
 enum Keychain {
     private static let service = "com.gc.PhotoSyncer.sftp"
 
@@ -68,7 +75,7 @@ enum Keychain {
         return SecItemAdd(attrs as CFDictionary, nil)
     }
 
-    static func password(account: String) -> String? {
+    static func lookupPassword(account: String) -> KeychainLookup {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -77,9 +84,26 @@ enum Keychain {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var out: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &out)
+        switch status {
+        case errSecSuccess:
+            guard let data = out as? Data, let pw = String(data: data, encoding: .utf8) else {
+                return .failure(errSecDecode)
+            }
+            return .success(pw)
+        case errSecItemNotFound:
+            return .notFound
+        case errSecInteractionNotAllowed, errSecUserCanceled, errSecAuthFailed, errSecNotAvailable, -25320:
+            // Keychain is locked (e.g. Dark Wake, screen lock, or right after reboot before unlock).
+            return .locked(status)
+        default:
+            return .failure(status)
+        }
+    }
+
+    static func password(account: String) -> String? {
+        if case .success(let pw) = lookupPassword(account: account) { return pw }
+        return nil
     }
 
     static func delete(account: String) {

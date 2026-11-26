@@ -4,6 +4,7 @@ import Foundation
 struct Part: Codable, Hashable {
     var hash: String      // SHA-256 of the content
     var type: Int         // PHAssetResourceType raw value
+    var size: UInt64?     // Expected byte length (nil on older ledger entries)
 }
 
 struct Entry: Codable {
@@ -13,6 +14,8 @@ struct Entry: Codable {
     var verified = true
     /// Synced by an old version that recorded no content hashes: trusted as done everywhere.
     var legacy: Bool?
+    /// Asset modificationDate when `parts` were exported (nil on entries from older versions).
+    var modifiedAt: Date?
 }
 
 struct Failure: Codable {
@@ -46,10 +49,12 @@ final class SyncedStore {
         var extraNames: [String: Set<String>] = [:]             // other names of already-known content, per destination
         var previews: [String: Preview] = [:]                   // asset id -> preview saved while the original is missing
         var retiredPreviews: [String: String] = [:]             // preview hash -> asset id, awaiting removal where the original now exists
+        var hashSizes: [String: UInt64] = [:]                   // content hash -> expected byte size
+        var canaryWritten: Set<String> = []                     // destination keys with `.photosyncer-id` written
 
         enum CodingKeys: String, CodingKey {
             case entries, placements, fingerprints, failures, pendingDelete, needsRebuild, duplicates
-            case extraNames, previews, retiredPreviews
+            case extraNames, previews, retiredPreviews, hashSizes, canaryWritten
         }
 
         init() {}
@@ -67,21 +72,27 @@ final class SyncedStore {
             extraNames = try c.decodeIfPresent([String: Set<String>].self, forKey: .extraNames) ?? [:]
             previews = try c.decodeIfPresent([String: Preview].self, forKey: .previews) ?? [:]
             retiredPreviews = try c.decodeIfPresent([String: String].self, forKey: .retiredPreviews) ?? [:]
+            hashSizes = try c.decodeIfPresent([String: UInt64].self, forKey: .hashSizes) ?? [:]
+            canaryWritten = try c.decodeIfPresent(Set<String>.self, forKey: .canaryWritten) ?? []
         }
     }
 
     private var ledger = Ledger()
     private let url: URL
+    private let backupURL: URL
     private let log = EventLog.shared
     private(set) var saveError: String?
 
     // MARK: Load / migrate
     /// `legacyDestinationID`: the single destination older versions used; their files map onto it.
-    init(legacyDestinationID: String?) {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    init(legacyDestinationID: String?, directory: URL? = nil) {
+        let dir = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         url = dir.appendingPathComponent("synced-ledger-v4.json")
+        backupURL = dir.appendingPathComponent("synced-ledger-v4.json.bak")
         let fm = FileManager.default
+        try? fm.removeItem(at: url.appendingPathExtension("tmp"))
+        try? fm.removeItem(at: backupURL.appendingPathExtension("tmp"))
         let v3 = dir.appendingPathComponent("synced-ledger-v3.json")
         let v2 = dir.appendingPathComponent("synced-ledger-v2.json")
         let v1 = dir.appendingPathComponent("synced-ledger.json")
@@ -90,8 +101,25 @@ final class SyncedStore {
         if fm.fileExists(atPath: url.path) {
             if let data = try? Data(contentsOf: url), let l = try? JSONDecoder().decode(Ledger.self, from: data) {
                 ledger = l
+            } else if let bakData = try? Data(contentsOf: backupURL),
+                      let l = try? JSONDecoder().decode(Ledger.self, from: bakData) {
+                let bad = url.deletingLastPathComponent()
+                    .appendingPathComponent("\(url.lastPathComponent).corrupt-\(Int(Date().timeIntervalSince1970))")
+                try? fm.moveItem(at: url, to: bad)
+                log.warning("Ledger unreadable (moved to \(bad.lastPathComponent)); recovered from backup ledger.")
+                ledger = l
+                save()
             } else {
                 quarantine(url)
+            }
+        } else if fm.fileExists(atPath: backupURL.path) {
+            if let bakData = try? Data(contentsOf: backupURL),
+               let l = try? JSONDecoder().decode(Ledger.self, from: bakData) {
+                log.warning("Primary ledger missing; recovered from backup ledger.")
+                ledger = l
+                save()
+            } else {
+                quarantine(backupURL)
             }
         } else if fm.fileExists(atPath: v3.path) {
             migrateV3(v3, dest: legacyDestinationID)
@@ -110,9 +138,15 @@ final class SyncedStore {
     /// Corrupt ledger: keep the bad file for inspection and rebuild knowledge from the files
     /// already in the destinations (see SyncEngine.rebuildIndex).
     private func quarantine(_ file: URL) {
+        let ts = Int(Date().timeIntervalSince1970)
         let dest = file.deletingLastPathComponent()
-            .appendingPathComponent("\(file.lastPathComponent).corrupt-\(Int(Date().timeIntervalSince1970))")
+            .appendingPathComponent("\(file.lastPathComponent).corrupt-\(ts)")
         try? FileManager.default.moveItem(at: file, to: dest)
+        if file != backupURL, FileManager.default.fileExists(atPath: backupURL.path) {
+            let bakDest = backupURL.deletingLastPathComponent()
+                .appendingPathComponent("\(backupURL.lastPathComponent).corrupt-\(ts)")
+            try? FileManager.default.moveItem(at: backupURL, to: bakDest)
+        }
         log.error("Ledger unreadable; moved to \(dest.lastPathComponent). Will rebuild index.")
         ledger = Ledger()
         ledger.needsRebuild = true
@@ -230,8 +264,43 @@ final class SyncedStore {
         ledger.retiredPreviews[hash] = nil                       // a re-used preview is live again
         ledger.previews[id] = Preview(hash: hash, version: version)
     }
-    func addPlacement(_ dest: String, hash: String, name: String) { ledger.placements[dest, default: [:]][hash] = name }
-    func removeDestination(_ dest: String) { ledger.placements[dest] = nil; ledger.extraNames[dest] = nil }
+    func addPlacement(_ dest: String, hash: String, name: String, size: UInt64? = nil) {
+        ledger.placements[dest, default: [:]][hash] = name
+        if let size, size > 0 { ledger.hashSizes[hash] = size }
+    }
+    func removeDestination(_ dest: String) {
+        ledger.placements[dest] = nil
+        ledger.extraNames[dest] = nil
+        ledger.canaryWritten.remove(dest)
+    }
+    func expectedSize(_ hash: String) -> UInt64? { ledger.hashSizes[hash] }
+    func hasCanary(_ dest: String) -> Bool { ledger.canaryWritten.contains(dest) }
+    func markCanaryWritten(_ dest: String) { ledger.canaryWritten.insert(dest) }
+
+    /// Recorded modification timestamps for synced non-legacy entries (used to detect post-sync edits).
+    var syncedModifiedDates: [String: Date] {
+        var out: [String: Date] = [:]
+        for (id, e) in ledger.entries where e.legacy != true {
+            if let m = e.modifiedAt { out[id] = m }
+        }
+        return out
+    }
+
+    func needsEditRefresh(_ id: String, modifiedAt: Date?) -> Bool {
+        guard let e = ledger.entries[id], e.legacy != true, let syncedMod = e.modifiedAt else { return false }
+        if syncedMod == .distantPast { return true }
+        guard let mod = modifiedAt else { return false }
+        return mod.timeIntervalSince(syncedMod) > 1.0
+    }
+
+    func updateModifiedAt(id: String, modifiedAt: Date?) {
+        ledger.entries[id]?.modifiedAt = modifiedAt
+    }
+
+    func markNeedsEditSync(_ id: String) {
+        guard ledger.entries[id] != nil else { return }
+        ledger.entries[id]?.modifiedAt = .distantPast
+    }
 
     /// Is every part of this asset present at `dest`? (Legacy entries count as done everywhere.)
     func isComplete(_ id: String, dest: String) -> Bool {
@@ -265,6 +334,9 @@ final class SyncedStore {
     // MARK: Mutations
     func recordSynced(id: String, entry: Entry, fingerprint: String?) {
         ledger.entries[id] = entry
+        for part in entry.parts {
+            if let sz = part.size, sz > 0 { ledger.hashSizes[part.hash] = sz }
+        }
         if let p = ledger.previews[id] {                         // the real original is here: retire the preview
             ledger.retiredPreviews[p.hash] = id
             ledger.previews[id] = nil
@@ -334,10 +406,44 @@ final class SyncedStore {
         for id in Array(ledger.failures.keys) where isComplete(id, dests: dests) { ledger.failures[id] = nil }
     }
 
-    /// Placements at `dest` whose file is gone. `existing` is one directory listing (normalized names).
-    func missingPlacements(dest: String, existing: Set<String>) -> (missing: [String], total: Int) {
-        guard let p = ledger.placements[dest] else { return ([], 0) }
-        return (p.filter { !existing.contains(FileNames.key($0.value)) }.map(\.key), p.count)
+    /// Placements at `dest` whose file is gone or no longer matches its recorded byte size.
+    /// `zeroByteKeys` lists normalized names of files that shrank to 0 bytes (truncation stubs).
+    func missingPlacements(dest: String, existing: Set<String>,
+                           sizes: [String: UInt64] = [:]) -> (missing: [String], zeroByteKeys: [String], total: Int) {
+        guard let p = ledger.placements[dest] else { return ([], [], 0) }
+        var missing: [String] = []
+        var zeroByteKeys: [String] = []
+        for (hash, name) in p {
+            let k = FileNames.key(name)
+            guard existing.contains(k) else {
+                missing.append(hash)
+                continue
+            }
+            if !sizes.isEmpty, let expected = ledger.hashSizes[hash], expected > 0,
+               let actual = sizes[k], actual != expected {
+                missing.append(hash)
+                if actual == 0 { zeroByteKeys.append(k) }
+            }
+        }
+        return (missing, zeroByteKeys, p.count)
+    }
+
+    /// Deterministic slice of placements at `dest` for rolling background checksum scrubbing.
+    func placementSlice(dest: String, offset: Int, count: Int) -> (slice: [(hash: String, name: String)], nextOffset: Int) {
+        guard let p = ledger.placements[dest], !p.isEmpty, count > 0 else { return ([], 0) }
+        let sorted = p.sorted { $0.value < $1.value }
+        let start = ((offset % sorted.count) + sorted.count) % sorted.count
+        var out: [(hash: String, name: String)] = []
+        let n = min(count, sorted.count)
+        for i in 0..<n {
+            let item = sorted[(start + i) % sorted.count]
+            out.append((hash: item.key, name: item.value))
+        }
+        return (out, (start + n) % sorted.count)
+    }
+
+    func allPlacements(dest: String) -> [(hash: String, name: String)] {
+        (ledger.placements[dest] ?? [:]).map { (hash: $0.key, name: $0.value) }.sorted { $0.name < $1.name }
     }
 
     /// Forget those placements so the affected assets re-sync to this destination only.
@@ -366,12 +472,48 @@ final class SyncedStore {
     // MARK: Persistence
     @discardableResult
     func save() -> Bool {
+        let fm = FileManager.default
+        let tmp = url.appendingPathExtension("tmp")
         do {
             let data = try JSONEncoder().encode(ledger)
-            try data.write(to: url, options: .atomic)
+            unlink(tmp.path)
+            guard fm.createFile(atPath: tmp.path, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            let h = try FileHandle(forWritingTo: tmp)
+            do {
+                try h.write(contentsOf: data)
+                if fcntl(h.fileDescriptor, F_FULLFSYNC) == -1 { try? h.synchronize() }
+                try h.close()
+            } catch {
+                try? h.close()
+                throw error
+            }
+
+            // Keep the previous valid generation as .bak before replacing the primary ledger.
+            if fm.fileExists(atPath: url.path),
+               ((try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0) > 2 {
+                let bakTmp = backupURL.appendingPathExtension("tmp")
+                unlink(bakTmp.path)
+                if link(url.path, bakTmp.path) == 0 || ((try? fm.copyItem(at: url, to: bakTmp)) != nil) {
+                    _ = Darwin.rename(bakTmp.path, backupURL.path)
+                } else {
+                    unlink(bakTmp.path)
+                }
+            }
+
+            guard Darwin.rename(tmp.path, url.path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            let dirFD = Darwin.open(url.deletingLastPathComponent().path, O_RDONLY)
+            if dirFD >= 0 {
+                _ = fsync(dirFD)
+                Darwin.close(dirFD)
+            }
             saveError = nil
             return true
         } catch {
+            unlink(tmp.path)
             saveError = error.localizedDescription
             log.error("Ledger save failed: \(error.localizedDescription)")
             return false

@@ -37,6 +37,7 @@ nonisolated struct LibraryItem: Sendable {
 nonisolated enum SyncError: LocalizedError {
     case message(String)
     case diskFull
+    case localDiskFull
     case permission(String)
     /// The original exists only in iCloud and Photos would not download it.
     case cloudOnly(String)
@@ -53,6 +54,8 @@ nonisolated enum SyncError: LocalizedError {
         case .paused: return "Paused"
         case .message(let m), .permission(let m): return m
         case .diskFull: return "The destination disk is full. Free up space; sync will resume automatically."
+        case .localDiskFull:
+            return "This Mac is low on startup disk space. Free up local disk space; sync will resume automatically."
         case .cloudOnly(let d):
             return "Original is only in iCloud and could not be downloaded. Open it in Photos or set Photos › Settings › iCloud › Download Originals. (\(d))"
         case .automationDenied:
@@ -713,6 +716,8 @@ nonisolated enum VerifiedCopy {
 }
 
 nonisolated enum FileNames {
+    static let canaryName = ".photosyncer-id"
+
     /// Replace characters SMB/NAS and other filesystems reject; trim trailing dots/spaces; cap length.
     static func sanitize(_ name: String) -> String {
         let illegal = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.controlCharacters)
@@ -752,4 +757,73 @@ nonisolated final class NetworkMonitor: @unchecked Sendable {
         if p.isExpensive { return "Waiting for a non-metered network" }
         return nil
     }
+}
+
+/// Runs potentially blocking VFS / filesystem calls (such as probing an offline NAS share) off the
+/// `@MainActor` and off Swift's cooperative thread pool, failing cleanly if the kernel call stalls.
+nonisolated enum BlockingIO {
+    private static let queue = DispatchQueue(label: "PhotoSyncer.blockingIO", qos: .utility, attributes: .concurrent)
+
+    static func run<T: Sendable>(timeout: TimeInterval,
+                                 timeoutMessage: String = "The destination volume stopped responding",
+                                 _ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
+            let dog = Watchdog()
+            queue.async {
+                do {
+                    let value = try work()
+                    if dog.finish() { cont.resume(returning: value) }
+                } catch {
+                    if dog.finish() { cont.resume(throwing: error) }
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                if dog.finish() {
+                    cont.resume(throwing: SyncError.destinationUnavailable(timeoutMessage))
+                }
+            }
+        }
+    }
+}
+
+/// Kernel-enforced advisory lock (`flock`) preventing two PhotoSyncer processes from racing on the ledger.
+/// Automatically released by the kernel even on `SIGKILL` or crash.
+nonisolated final class InstanceLock: @unchecked Sendable {
+    private let lockPath: String
+    private var fd: Int32 = -1
+
+    init(directory: URL? = nil) {
+        let dir = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        lockPath = dir.appendingPathComponent("photosyncer.lock").path
+    }
+
+    func acquire(retryTimeout: TimeInterval = 1.5) -> Bool {
+        if fd >= 0 { return true }
+        let opened = Darwin.open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard opened >= 0 else { return true }
+        let deadline = Date().addingTimeInterval(max(retryTimeout, 0))
+        while true {
+            if flock(opened, LOCK_EX | LOCK_NB) == 0 {
+                fd = opened
+                let pidText = "\(getpid())\n"
+                _ = ftruncate(opened, 0)
+                _ = pidText.withCString { Darwin.write(opened, $0, strlen($0)) }
+                return true
+            }
+            if Date() >= deadline { break }
+            usleep(100_000)
+        }
+        Darwin.close(opened)
+        return false
+    }
+
+    func release() {
+        guard fd >= 0 else { return }
+        _ = flock(fd, LOCK_UN)
+        Darwin.close(fd)
+        fd = -1
+    }
+
+    deinit { release() }
 }

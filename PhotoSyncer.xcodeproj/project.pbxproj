@@ -10,15 +10,31 @@
 		5E7C1D5C30B3FE9000B02D83 /* Citadel in Frameworks */ = {isa = PBXBuildFile; productRef = 5E7C1D5B30B3FE9000B02D83 /* Citadel */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		5E7C1D7030B3FEB000B02D83 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5E7C1D2B30B3FE2C00B02D83 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5E7C1D3230B3FE2C00B02D83;
+			remoteInfo = PhotoSyncer;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		5E7C1D3330B3FE2C00B02D83 /* PhotoSyncer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoSyncer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Signing.xcconfig; sourceTree = "<group>"; };
+		5E7C1D7230B3FEB000B02D83 /* PhotoSyncerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoSyncerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		5E7C1D3530B3FE2C00B02D83 /* PhotoSyncer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = PhotoSyncer;
+			sourceTree = "<group>";
+		};
+		5E7C1D7330B3FEB000B02D83 /* PhotoSyncerTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = PhotoSyncerTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -32,6 +48,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		5E7C1D7530B3FEB000B02D83 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -40,6 +63,7 @@
 			children = (
 				5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */,
 				5E7C1D3530B3FE2C00B02D83 /* PhotoSyncer */,
+				5E7C1D7330B3FEB000B02D83 /* PhotoSyncerTests */,
 				5E7C1D3430B3FE2C00B02D83 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -48,6 +72,7 @@
 			isa = PBXGroup;
 			children = (
 				5E7C1D3330B3FE2C00B02D83 /* PhotoSyncer.app */,
+				5E7C1D7230B3FEB000B02D83 /* PhotoSyncerTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -78,6 +103,27 @@
 			productReference = 5E7C1D3330B3FE2C00B02D83 /* PhotoSyncer.app */;
 			productType = "com.apple.product-type.application";
 		};
+		5E7C1D7730B3FEB000B02D83 /* PhotoSyncerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5E7C1D7A30B3FEB000B02D83 /* Build configuration list for PBXNativeTarget "PhotoSyncerTests" */;
+			buildPhases = (
+				5E7C1D7430B3FEB000B02D83 /* Sources */,
+				5E7C1D7530B3FEB000B02D83 /* Frameworks */,
+				5E7C1D7630B3FEB000B02D83 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5E7C1D7130B3FEB000B02D83 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				5E7C1D7330B3FEB000B02D83 /* PhotoSyncerTests */,
+			);
+			name = PhotoSyncerTests;
+			productName = PhotoSyncerTests;
+			productReference = 5E7C1D7230B3FEB000B02D83 /* PhotoSyncerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -90,6 +136,10 @@
 				TargetAttributes = {
 					5E7C1D3230B3FE2C00B02D83 = {
 						CreatedOnToolsVersion = 26.5;
+					};
+					5E7C1D7730B3FEB000B02D83 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 5E7C1D3230B3FE2C00B02D83;
 					};
 				};
 			};
@@ -111,12 +161,20 @@
 			projectRoot = "";
 			targets = (
 				5E7C1D3230B3FE2C00B02D83 /* PhotoSyncer */,
+				5E7C1D7730B3FEB000B02D83 /* PhotoSyncerTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		5E7C1D3130B3FE2C00B02D83 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5E7C1D7630B3FEB000B02D83 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -133,7 +191,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		5E7C1D7430B3FEB000B02D83 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5E7C1D7130B3FEB000B02D83 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5E7C1D3230B3FE2C00B02D83 /* PhotoSyncer */;
+			targetProxy = 5E7C1D7030B3FEB000B02D83 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		5E7C1D3C30B3FE3000B02D83 /* Debug */ = {
@@ -260,8 +333,9 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = PhotoSyncer.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -271,6 +345,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = PhotoSyncer;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "PhotoSyncer asks the Photos app to download and export original photos that are only stored in iCloud.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -296,8 +372,9 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = PhotoSyncer.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -307,6 +384,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = PhotoSyncer;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "PhotoSyncer asks the Photos app to download and export original photos that are only stored in iCloud.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -328,6 +407,46 @@
 			};
 			name = Release;
 		};
+		5E7C1D7830B3FEB000B02D83 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gc.PhotoSyncerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/PhotoSyncer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/PhotoSyncer";
+			};
+			name = Debug;
+		};
+		5E7C1D7930B3FEB000B02D83 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5E7C1D6030B3FEA000B02D83 /* Config/Signing.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gc.PhotoSyncerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/PhotoSyncer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/PhotoSyncer";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -345,6 +464,15 @@
 			buildConfigurations = (
 				5E7C1D3F30B3FE3000B02D83 /* Debug */,
 				5E7C1D4030B3FE3000B02D83 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5E7C1D7A30B3FEB000B02D83 /* Build configuration list for PBXNativeTarget "PhotoSyncerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5E7C1D7830B3FEB000B02D83 /* Debug */,
+				5E7C1D7930B3FEB000B02D83 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

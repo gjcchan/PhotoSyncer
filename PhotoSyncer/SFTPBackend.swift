@@ -35,6 +35,7 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
     private let username: String
     private let password: String
     private let base: String
+    private let allowCreateBase: Bool
     private let pinnedKey: String?
     private let onNewHostKey: @Sendable (String) -> Void
     /// Bigger reads can stall inside swift-nio-ssh (the same limit Citadel works around for writes).
@@ -44,10 +45,12 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
 
     var localRoot: URL? { nil }
 
-    init(dest: Destination, password: String, onNewHostKey: @escaping @Sendable (String) -> Void) {
+    init(dest: Destination, password: String, allowCreateBase: Bool = true,
+         onNewHostKey: @escaping @Sendable (String) -> Void) {
         host = dest.host; port = dest.port; username = dest.username
         self.password = password
         base = dest.remotePath.trimmingCharacters(in: .whitespaces)
+        self.allowCreateBase = allowCreateBase
         pinnedKey = dest.trustedHostKey
         self.onNewHostKey = onNewHostKey
     }
@@ -110,6 +113,14 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
     private func ensureBase() async throws {
         let sftp = try client()
         guard !base.isEmpty, base != "/" else { return }
+        if !allowCreateBase {
+            let target = base
+            guard (try? await withTimeout(30) { try await sftp.getAttributes(at: target) }) != nil else {
+                throw SyncError.destinationUnavailable(
+                    "Remote folder \(target) is missing on \(host) (backing volume unmounted on the server?)")
+            }
+            return
+        }
         var cur = base.hasPrefix("/") ? "/" : ""
         for comp in base.split(separator: "/") {
             cur = (cur.isEmpty || cur == "/") ? cur + comp : cur + "/" + comp
@@ -195,6 +206,15 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
     func upload(local: URL, as name: String, size: UInt64, hash: String, date: Date?) async throws {
         let sftp = try client()
         let final = path(name)
+
+        let inflight = path(".\(name).inflight")
+        if (try? await withTimeout(30) { try await sftp.getAttributes(at: inflight) }) != nil {
+            await removeQuietly(final)
+            await removeQuietly(inflight)
+            await MainActor.run {
+                EventLog.shared.info("Removed interrupted direct upload of \(name) on \(self.host); re-copying")
+            }
+        }
 
         for candidate in [".\(name).partial", "\(name).partial"] {
             let existingPartial = path(candidate)
@@ -308,6 +328,37 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
         catch { throw Self.map(error, pinned: pinnedKey != nil) }
     }
 
+    func readCanary() async throws -> String? {
+        let sftp = try client()
+        let p = path(FileNames.canaryName)
+        guard (try? await withTimeout(15) { try await sftp.getAttributes(at: p) }) != nil else { return nil }
+        let f = try await withTimeout(15) { try await sftp.openFile(filePath: p, flags: .read) }
+        do {
+            let buf = try await withTimeout(15) { try await f.read(from: 0, length: 256) }
+            try? await withTimeout(5) { try await f.close() }
+            let text = String(data: Data(buf.readableBytesView), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (text?.isEmpty == false) ? text : nil
+        } catch {
+            try? await withTimeout(5) { try await f.close() }
+            throw Self.map(error, pinned: pinnedKey != nil)
+        }
+    }
+
+    func writeCanary(_ id: String) async throws {
+        let sftp = try client()
+        let p = path(FileNames.canaryName)
+        let f = try await withTimeout(15) { try await sftp.openFile(filePath: p, flags: [.write, .create, .truncate]) }
+        do {
+            let buffer = ByteBuffer(bytes: Array((id + "\n").utf8))
+            try await withTimeout(15) { try await f.write(buffer, at: 0) }
+            try await withTimeout(15) { try await f.close() }
+        } catch {
+            try? await withTimeout(5) { try await f.close() }
+            throw Self.map(error, pinned: pinnedKey != nil)
+        }
+    }
+
     func cleanup() async {
         guard sftp != nil, let all = try? await rawList() else { return }
         for f in all where f.name.hasPrefix(".") {
@@ -323,8 +374,10 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
     }
 
     func close() async {
-        if let sftp { try? await sftp.close() }
-        if let ssh { try? await ssh.close() }
+        let sftpClient = sftp
+        let sshClient = ssh
         sftp = nil; ssh = nil
+        if let sftpClient { _ = try? await withTimeout(5, timeoutMessage: "SFTP close timed out") { try await sftpClient.close() } }
+        if let sshClient { _ = try? await withTimeout(5, timeoutMessage: "SSH close timed out") { try await sshClient.close() } }
     }
 }
