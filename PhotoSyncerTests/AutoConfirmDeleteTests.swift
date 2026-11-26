@@ -173,4 +173,80 @@ struct AutoConfirmDeleteTests {
         #expect(files.isEmpty)
         await backend.close()
     }
+
+    @Test func dailyScheduleWindowHandles3AMBoundariesAndMidnightWraparound() throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+
+        func makeDate(day: Int, hour: Int, minute: Int) -> Date {
+            cal.date(from: DateComponents(year: 2026, month: 11, day: day, hour: hour, minute: minute, second: 0))!
+        }
+
+        // 3:00 AM target (180 minutes): active [03:00, 04:00), inactive outside.
+        let target3AM = 3 * 60
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 2, minute: 59), targetMinutes: target3AM, calendar: cal) == false)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 3, minute: 0), targetMinutes: target3AM, calendar: cal) == true)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 3, minute: 45), targetMinutes: target3AM, calendar: cal) == true)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 4, minute: 0), targetMinutes: target3AM, calendar: cal) == false)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 15, minute: 30), targetMinutes: target3AM, calendar: cal) == false)
+
+        // 11:30 PM target (1410 minutes): crosses midnight cleanly into [00:00, 00:30) of next day.
+        let target1130PM = 23 * 60 + 30
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 23, minute: 29), targetMinutes: target1130PM, calendar: cal) == false)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 25, hour: 23, minute: 45), targetMinutes: target1130PM, calendar: cal) == true)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 26, hour: 0, minute: 15), targetMinutes: target1130PM, calendar: cal) == true)
+        #expect(DeleteSchedule.isWithinWindow(now: makeDate(day: 26, hour: 0, minute: 30), targetMinutes: target1130PM, calendar: cal) == false)
+
+        // Daily sync due logic: editing schedule at 11:14 PM does not falsely trigger today's past 3:00 AM slot,
+        // triggers at 3:00 AM next morning even after a 9:00 PM manual sync, and respects catchUpIfMissed.
+        let manualSync9PM = makeDate(day: 25, hour: 21, minute: 0)
+        let edited1114PM = makeDate(day: 25, hour: 23, minute: 14)
+        #expect(DailySchedule.isDailySyncDue(
+            now: makeDate(day: 25, hour: 23, minute: 15),
+            lastSync: manualSync9PM,
+            scheduleChangedAt: edited1114PM,
+            targetMinutes: target3AM,
+            catchUpIfMissed: true,
+            calendar: cal
+        ) == false)
+
+        // Fires at 3:00 AM next morning even though manualSync9PM was only 6 hours earlier.
+        #expect(DailySchedule.isDailySyncDue(
+            now: makeDate(day: 26, hour: 3, minute: 0),
+            lastSync: manualSync9PM,
+            scheduleChangedAt: edited1114PM,
+            targetMinutes: target3AM,
+            catchUpIfMissed: true,
+            calendar: cal
+        ) == true)
+
+        // Once 3:04 AM finishes, does not fire again at 3:30 AM.
+        let synced304AM = makeDate(day: 26, hour: 3, minute: 4)
+        #expect(DailySchedule.isDailySyncDue(
+            now: makeDate(day: 26, hour: 3, minute: 30),
+            lastSync: synced304AM,
+            scheduleChangedAt: edited1114PM,
+            targetMinutes: target3AM,
+            catchUpIfMissed: true,
+            calendar: cal
+        ) == false)
+
+        // Missed 3:00 AM run checked at 8:30 AM: runs when catchUpIfMissed is true, skips when false.
+        #expect(DailySchedule.isDailySyncDue(
+            now: makeDate(day: 27, hour: 8, minute: 30),
+            lastSync: synced304AM,
+            scheduleChangedAt: edited1114PM,
+            targetMinutes: target3AM,
+            catchUpIfMissed: true,
+            calendar: cal
+        ) == true)
+        #expect(DailySchedule.isDailySyncDue(
+            now: makeDate(day: 27, hour: 8, minute: 30),
+            lastSync: synced304AM,
+            scheduleChangedAt: edited1114PM,
+            targetMinutes: target3AM,
+            catchUpIfMissed: false,
+            calendar: cal
+        ) == false)
+    }
 }

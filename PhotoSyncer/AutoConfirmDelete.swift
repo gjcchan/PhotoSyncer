@@ -382,11 +382,32 @@ private nonisolated final class PromptWatchSession: @unchecked Sendable {
 }
 #endif
 
+// MARK: - Daily Delete Time Window
+
+nonisolated enum DeleteSchedule {
+    static let defaultMinutes = DailySchedule.defaultMinutes
+    static let windowMinutes = DailySchedule.windowMinutes
+
+    static func isWithinWindow(now: Date,
+                               targetMinutes: Int,
+                               windowMinutes: Int = Self.windowMinutes,
+                               calendar: Calendar = .current) -> Bool {
+        DailySchedule.isWithinWindow(
+            now: now,
+            targetMinutes: targetMinutes,
+            windowMinutes: windowMinutes,
+            calendar: calendar
+        )
+    }
+}
+
 // MARK: - Observable Controller
 
 @MainActor
 final class DeleteAutoConfirmController: ObservableObject {
     private static let defaultsKey = "autoConfirmDeletePrompt"
+    private static let scheduleEnabledKey = "autoConfirmScheduleEnabled"
+    private static let scheduleMinutesKey = "autoConfirmScheduleMinutes"
     private let defaults = UserDefaults.standard
     private var activeObserver: NSObjectProtocol?
 
@@ -395,6 +416,26 @@ final class DeleteAutoConfirmController: ObservableObject {
             defaults.set(isEnabled, forKey: Self.defaultsKey)
             refreshAccessibilityTrust()
             EventLog.shared.info("Auto-confirm delete prompt \(isEnabled ? "enabled" : "disabled")")
+        }
+    }
+
+    @Published var scheduleEnabled: Bool {
+        didSet {
+            guard scheduleEnabled != oldValue else { return }
+            defaults.set(scheduleEnabled, forKey: Self.scheduleEnabledKey)
+            EventLog.shared.info(scheduleEnabled
+                ? "Scheduled auto-delete enabled for \(formattedScheduleTime)"
+                : "Scheduled auto-delete time disabled")
+        }
+    }
+
+    /// Minutes after midnight in local time (0...1439); defaults to 180 (3:00 AM).
+    @Published var scheduleMinutes: Int {
+        didSet {
+            let clamped = ((scheduleMinutes % 1440) + 1440) % 1440
+            if clamped != scheduleMinutes { scheduleMinutes = clamped; return }
+            guard scheduleMinutes != oldValue else { return }
+            defaults.set(scheduleMinutes, forKey: Self.scheduleMinutesKey)
         }
     }
 
@@ -412,8 +453,61 @@ final class DeleteAutoConfirmController: ObservableObject {
         isSupported && isEnabled && isAccessibilityTrusted
     }
 
+    var hasActiveSchedule: Bool {
+        isSupported && isEnabled && scheduleEnabled
+    }
+
+    var scheduleDate: Date {
+        get {
+            Calendar.current.date(
+                bySettingHour: scheduleMinutes / 60,
+                minute: scheduleMinutes % 60,
+                second: 0,
+                of: Date()
+            ) ?? Date()
+        }
+        set {
+            let comps = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+            let mins = DailySchedule.clampMinutes((comps.hour ?? 3) * 60 + (comps.minute ?? 0))
+            if mins != scheduleMinutes { scheduleMinutes = mins }
+        }
+    }
+
+    var formattedScheduleTime: String {
+        scheduleDate.formatted(date: .omitted, time: .shortened)
+    }
+
+    var formattedWindowEnd: String {
+        let endMinutes = (scheduleMinutes + DeleteSchedule.windowMinutes) % 1440
+        let endDate = Calendar.current.date(
+            bySettingHour: endMinutes / 60,
+            minute: endMinutes % 60,
+            second: 0,
+            of: Date()
+        ) ?? Date()
+        return endDate.formatted(date: .omitted, time: .shortened)
+    }
+
+    /// True unless a daily delete schedule is active and `now` is outside the scheduled window.
+    func allowsScheduledDeletion(now: Date = Date()) -> Bool {
+        guard hasActiveSchedule else { return true }
+        return DeleteSchedule.isWithinWindow(now: now, targetMinutes: scheduleMinutes)
+    }
+
+    var deferredScheduleDescription: String? {
+        guard hasActiveSchedule, !allowsScheduledDeletion() else { return nil }
+        return "scheduled auto-delete at \(formattedScheduleTime)"
+    }
+
     init() {
         isEnabled = defaults.bool(forKey: Self.defaultsKey)
+        scheduleEnabled = defaults.bool(forKey: Self.scheduleEnabledKey)
+        if defaults.object(forKey: Self.scheduleMinutesKey) != nil {
+            let saved = defaults.integer(forKey: Self.scheduleMinutesKey)
+            scheduleMinutes = ((saved % 1440) + 1440) % 1440
+        } else {
+            scheduleMinutes = DeleteSchedule.defaultMinutes
+        }
         #if APP_SANDBOX_YES
         isAccessibilityTrusted = false
         #else
@@ -489,6 +583,9 @@ final class DeleteAutoConfirmController: ObservableObject {
 
 struct AutoConfirmDeleteSettingsSection: View {
     @ObservedObject var controller: DeleteAutoConfirmController
+    var manualHoldActive: Bool = false
+    var onAllowScheduledRuns: () -> Void = {}
+    var onScheduleChanged: () -> Void = {}
     @State private var showEnableWarning = false
 
     var body: some View {
@@ -530,6 +627,45 @@ struct AutoConfirmDeleteSettingsSection: View {
                                 .controlSize(.small)
                                 Button("Check Again") {
                                     controller.refreshAccessibilityTrust()
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+
+                    Toggle("Only auto-delete at a scheduled time", isOn: Binding(
+                        get: { controller.scheduleEnabled },
+                        set: { newValue in
+                            controller.scheduleEnabled = newValue
+                            onScheduleChanged()
+                        }
+                    ))
+
+                    if controller.scheduleEnabled {
+                        DatePicker(
+                            "Scheduled time",
+                            selection: Binding(
+                                get: { controller.scheduleDate },
+                                set: { newDate in
+                                    controller.scheduleDate = newDate
+                                    onScheduleChanged()
+                                }
+                            ),
+                            displayedComponents: .hourAndMinute
+                        )
+
+                        Text("Verified deletions stay queued during the day and run between \(controller.formattedScheduleTime) and \(controller.formattedWindowEnd) while your Mac is awake, avoiding focus interruptions while you work. Manual “Delete … Queued from iCloud…” in the menu bar still works anytime.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if manualHoldActive {
+                            HStack(spacing: 8) {
+                                Image(systemName: "info.circle.fill").foregroundStyle(.orange)
+                                Text("“Hold deletions in queue until I click Delete in the menu” is on above, which prevents automatic runs at \(controller.formattedScheduleTime).")
+                                    .font(.caption)
+                                Spacer()
+                                Button("Allow Scheduled Runs") {
+                                    onAllowScheduledRuns()
                                 }
                                 .controlSize(.small)
                             }

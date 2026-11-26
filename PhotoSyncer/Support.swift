@@ -8,11 +8,104 @@ import AppKit
 import Network
 import CryptoKit
 
+enum SyncScheduleMode: String, CaseIterable, Identifiable {
+    case interval
+    case daily
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .interval: return "Every fixed interval"
+        case .daily: return "Daily at a set time"
+        }
+    }
+}
+
 enum SyncInterval: Int, CaseIterable, Identifiable {
     case h1 = 1, h4 = 4, h12 = 12, h24 = 24
     var id: Int { rawValue }
     var label: String { "\(rawValue) hour\(rawValue == 1 ? "" : "s")" }
     var seconds: TimeInterval { TimeInterval(rawValue) * 3600 }
+}
+
+nonisolated enum DailySchedule {
+    static let defaultMinutes = 3 * 60      // 3:00 AM
+    static let windowMinutes = 60           // 1-hour window when strict in-window execution is used
+
+    static func clampMinutes(_ minutes: Int) -> Int {
+        ((minutes % 1440) + 1440) % 1440
+    }
+
+    /// Most recent occurrence of `targetMinutes` (minutes after midnight) at or before `now`.
+    static func mostRecentOccurrence(atOrBefore now: Date,
+                                     targetMinutes: Int,
+                                     calendar: Calendar = .current) -> Date? {
+        let clamped = clampMinutes(targetMinutes)
+        let hour = clamped / 60, minute = clamped % 60
+        let startOfToday = calendar.startOfDay(for: now)
+        if let todayTarget = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: startOfToday),
+           todayTarget <= now {
+            return todayTarget
+        }
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: startOfToday) else { return nil }
+        return calendar.date(bySettingHour: hour, minute: minute, second: 0, of: yesterday)
+    }
+
+    /// Next upcoming occurrence of `targetMinutes` strictly after `now`.
+    static func nextOccurrence(after now: Date,
+                               targetMinutes: Int,
+                               calendar: Calendar = .current) -> Date? {
+        let clamped = clampMinutes(targetMinutes)
+        let hour = clamped / 60, minute = clamped % 60
+        let startOfToday = calendar.startOfDay(for: now)
+        if let todayTarget = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: startOfToday),
+           todayTarget > now {
+            return todayTarget
+        }
+        guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday) else { return nil }
+        return calendar.date(bySettingHour: hour, minute: minute, second: 0, of: tomorrow)
+    }
+
+    /// True when `now` falls within `[targetTime, targetTime + windowMinutes)` in `calendar`
+    /// (handles windows crossing midnight, such as 11:30 PM → 12:30 AM).
+    static func isWithinWindow(now: Date,
+                               targetMinutes: Int,
+                               windowMinutes: Int = Self.windowMinutes,
+                               calendar: Calendar = .current) -> Bool {
+        guard let recent = mostRecentOccurrence(atOrBefore: now, targetMinutes: targetMinutes, calendar: calendar) else {
+            return false
+        }
+        let elapsed = now.timeIntervalSince(recent)
+        return elapsed >= 0 && elapsed < TimeInterval(max(windowMinutes, 1) * 60)
+    }
+
+    /// Determines whether a daily scheduled sync is due at `now`.
+    /// Uses `max(lastSync, scheduleChangedAt)` so changing the time in Settings never falsely treats
+    /// an earlier hour today as a missed run, while a manual evening sync still lets a 3:00 AM sync run.
+    static func isDailySyncDue(now: Date,
+                               lastSync: Date?,
+                               scheduleChangedAt: Date?,
+                               targetMinutes: Int,
+                               catchUpIfMissed: Bool,
+                               windowMinutes: Int = Self.windowMinutes,
+                               calendar: Calendar = .current) -> Bool {
+        if !catchUpIfMissed {
+            guard isWithinWindow(now: now, targetMinutes: targetMinutes, windowMinutes: windowMinutes, calendar: calendar) else {
+                return false
+            }
+        }
+        guard let recent = mostRecentOccurrence(atOrBefore: now, targetMinutes: targetMinutes, calendar: calendar) else {
+            return lastSync == nil
+        }
+        if let lastSync {
+            let baseline = scheduleChangedAt.map { max(lastSync, $0) } ?? lastSync
+            return recent > baseline
+        } else if let scheduleChangedAt {
+            return recent > scheduleChangedAt
+        } else {
+            return true
+        }
+    }
 }
 
 enum DeleteStyle: String, CaseIterable, Identifiable {

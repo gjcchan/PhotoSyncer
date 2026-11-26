@@ -13,7 +13,7 @@ Requires MacOS, use at your own risk.
 
 ## Features
 
-- **Menu-Bar Background Sync**: Runs quietly from the macOS menu bar on a configurable schedule (1, 4, 12, or 24 hours) with Launch at Login, Pause/Resume, live status and deletion-queue (`count (size)`) readout, and recovery across sleep/wake, network changes, and drive reconnects.
+- **Menu-Bar Background Sync**: Runs quietly from the macOS menu bar on a configurable schedule (every 1, 4, 12, or 24 hours, or daily at a set time) with Launch at Login, Pause/Resume, live status and deletion-queue (`count (size)`) readout, and recovery across sleep/wake, network changes, and drive reconnects.
 - **Full Library Asset Support**: Exports original photos and videos along with edited renders, RAW/JPEG pairs, and Live Photo paired videos.
 - **Multiple Destinations (Folders, SMB & SFTP)**: Syncs to local disks, USB drives, mounted NAS shares (via security-scoped bookmarks), SMB network shares (via macOS's built-in SMB client with Keychain-stored passwords or guest access), and SFTP servers (with Keychain-stored passwords and trust-on-first-use SSH host-key pinning).
 - **Cross-Destination Sync**: Optional copy-only mirroring keeps multiple destinations eventually consistent by copying missing files between them based on SHA-256 content hashes.

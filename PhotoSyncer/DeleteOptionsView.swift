@@ -128,7 +128,12 @@ struct DeleteOptionsView: View {
                     Text(holdSummary).font(.caption).foregroundStyle(.secondary)
                 }
 
-                AutoConfirmDeleteSettingsSection(controller: syncer.autoConfirm)
+                AutoConfirmDeleteSettingsSection(
+                    controller: syncer.autoConfirm,
+                    manualHoldActive: syncer.holdDeletions && !syncer.holdThresholdEnabled,
+                    onAllowScheduledRuns: { syncer.holdDeletions = false },
+                    onScheduleChanged: { if syncer.shouldAutoProcessDeletions { syncer.resetDeleteRetry() } }
+                )
 
                 if syncer.deleteStyle == .justSynced {
                     Section("Already-synced items") {

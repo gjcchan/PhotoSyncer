@@ -119,8 +119,36 @@ final class SyncEngine: ObservableObject {
     /// Set when iCloud refuses to hand over originals for (nearly) everything: retrying won't help.
     @Published var cloudDiagnosis: String?
 
+    @Published var scheduleMode: SyncScheduleMode {
+        didSet {
+            guard scheduleMode != oldValue else { return }
+            defaults.set(scheduleMode.rawValue, forKey: "scheduleMode")
+            scheduleChangedAt = Date()
+            runBackoffUntil = .distantPast
+        }
+    }
     @Published var interval: SyncInterval {
-        didSet { defaults.set(interval.rawValue, forKey: "interval") }
+        didSet {
+            guard interval != oldValue else { return }
+            defaults.set(interval.rawValue, forKey: "interval")
+            runBackoffUntil = .distantPast
+        }
+    }
+    @Published var dailySyncMinutes: Int {
+        didSet {
+            let clamped = DailySchedule.clampMinutes(dailySyncMinutes)
+            if clamped != dailySyncMinutes { dailySyncMinutes = clamped; return }
+            guard dailySyncMinutes != oldValue else { return }
+            defaults.set(dailySyncMinutes, forKey: "dailySyncMinutes")
+            scheduleChangedAt = Date()
+            runBackoffUntil = .distantPast
+        }
+    }
+    @Published var dailyCatchUpIfMissed: Bool {
+        didSet {
+            guard dailyCatchUpIfMissed != oldValue else { return }
+            defaults.set(dailyCatchUpIfMissed, forKey: "dailyCatchUpIfMissed")
+        }
     }
     @Published var deleteStyle: DeleteStyle {
         didSet {
@@ -213,6 +241,42 @@ final class SyncEngine: ObservableObject {
         get { defaults.object(forKey: "deleteRetryAt") as? Date ?? .distantPast }
         set { defaults.set(newValue, forKey: "deleteRetryAt") }
     }
+    private var scheduleChangedAt: Date? {
+        get { defaults.object(forKey: "scheduleChangedAt") as? Date }
+        set { defaults.set(newValue, forKey: "scheduleChangedAt") }
+    }
+
+    var dailySyncDate: Date {
+        get {
+            Calendar.current.date(
+                bySettingHour: dailySyncMinutes / 60,
+                minute: dailySyncMinutes % 60,
+                second: 0,
+                of: Date()
+            ) ?? Date()
+        }
+        set {
+            let comps = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+            let mins = DailySchedule.clampMinutes((comps.hour ?? 3) * 60 + (comps.minute ?? 0))
+            if mins != dailySyncMinutes { dailySyncMinutes = mins }
+        }
+    }
+
+    var dailyScheduleSummary: String {
+        let now = Date()
+        guard let next = DailySchedule.nextOccurrence(after: now, targetMinutes: dailySyncMinutes) else {
+            return "Syncs once a day at \(dailySyncDate.formatted(date: .omitted, time: .shortened))."
+        }
+        let dayLabel = Calendar.current.isDateInToday(next) ? "Today" : "Tomorrow"
+        let timeStr = next.formatted(date: .omitted, time: .shortened)
+        if dailyCatchUpIfMissed {
+            return "Next scheduled sync: \(dayLabel) at \(timeStr)."
+        }
+        let endMin = DailySchedule.clampMinutes(dailySyncMinutes + DailySchedule.windowMinutes)
+        let endStr = (Calendar.current.date(bySettingHour: endMin / 60, minute: endMin % 60, second: 0, of: now) ?? now)
+            .formatted(date: .omitted, time: .shortened)
+        return "Next scheduled sync: \(dayLabel) between \(timeStr) and \(endStr) (skipped if Mac is asleep)."
+    }
 
     var installWarning: String? {
         Bundle.main.bundlePath.hasPrefix("/Applications")
@@ -256,14 +320,28 @@ final class SyncEngine: ObservableObject {
     /// Whether a scheduled/automatic sync should submit the deletion queue to macOS right now.
     var shouldAutoProcessDeletions: Bool {
         guard deleteAfterSync, !store.pendingDelete.isEmpty else { return false }
+        guard autoConfirm.allowsScheduledDeletion() else { return false }
         if !holdDeletions { return true }
         guard holdThresholdEnabled else { return false }
         return pendingDeleteBytes >= Int64(holdThresholdGB) * 1_000_000_000
     }
 
+    func resetDeleteRetry() { deleteRetryAt = .distantPast }
+
     // MARK: Init
     init() {
+        scheduleMode = SyncScheduleMode(rawValue: defaults.string(forKey: "scheduleMode") ?? "") ?? .interval
         interval = SyncInterval(rawValue: defaults.integer(forKey: "interval")) ?? .h1
+        if defaults.object(forKey: "dailySyncMinutes") != nil {
+            dailySyncMinutes = DailySchedule.clampMinutes(defaults.integer(forKey: "dailySyncMinutes"))
+        } else {
+            dailySyncMinutes = DailySchedule.defaultMinutes
+        }
+        if defaults.object(forKey: "dailyCatchUpIfMissed") != nil {
+            dailyCatchUpIfMissed = defaults.bool(forKey: "dailyCatchUpIfMissed")
+        } else {
+            dailyCatchUpIfMissed = true
+        }
         deleteAfterSync = defaults.bool(forKey: "deleteAfterSync")
         let style = DeleteStyle(rawValue: defaults.string(forKey: "deleteStyle") ?? "") ?? .justSynced
         let savedBudget = defaults.integer(forKey: "budgetGB")
@@ -409,7 +487,19 @@ final class SyncEngine: ObservableObject {
         let enabled = enabledDestinations
         guard !enabled.isEmpty else { return }
 
-        var due = lastSync.map { now.timeIntervalSince($0) >= interval.seconds } ?? true
+        var due: Bool
+        switch scheduleMode {
+        case .interval:
+            due = lastSync.map { now.timeIntervalSince($0) >= interval.seconds } ?? true
+        case .daily:
+            due = DailySchedule.isDailySyncDue(
+                now: now,
+                lastSync: lastSync,
+                scheduleChangedAt: scheduleChangedAt,
+                targetMinutes: dailySyncMinutes,
+                catchUpIfMissed: dailyCatchUpIfMissed
+            )
+        }
         if needsResume { due = true }                               // an earlier run was cut short
         if waitingForDestination {
             var anyReachable = false
@@ -657,6 +747,7 @@ final class SyncEngine: ObservableObject {
         needsConfirmReconcile = false
         runBackoffUntil = .distantPast
         lastError = nil
+        scheduleChangedAt = nil
         lastSync = nil                      // triggers a sync that brings the new destination up to date
     }
 
@@ -1136,7 +1227,7 @@ final class SyncEngine: ObservableObject {
 
         log.clear()
         store.resetAll()
-        for k in ["lastSync", "deleteRetryAt", "forceReconcile", "pendingDeleteBytes"] { defaults.removeObject(forKey: k) }
+        for k in ["lastSync", "deleteRetryAt", "forceReconcile", "pendingDeleteBytes", "scheduleChangedAt"] { defaults.removeObject(forKey: k) }
         pendingDeleteBytes = 0
         lastSync = nil
         runBackoffUntil = .distantPast
@@ -1446,7 +1537,9 @@ final class SyncEngine: ObservableObject {
             } else if !store.pendingDelete.isEmpty {
                 let sz = pendingDeleteBytes > 0
                     ? " (\(ByteCountFormatter.string(fromByteCount: pendingDeleteBytes, countStyle: .file)))" : ""
-                if holdThresholdEnabled {
+                if let scheduled = autoConfirm.deferredScheduleDescription {
+                    log.info("Holding \(store.pendingDelete.count) item(s)\(sz) in deletion queue until \(scheduled)")
+                } else if holdThresholdEnabled {
                     log.info("Holding \(store.pendingDelete.count) item(s)\(sz) in deletion queue until it reaches \(holdThresholdGB) GB (or manual delete)")
                 } else {
                     log.info("Holding \(store.pendingDelete.count) item(s)\(sz) in deletion queue until manually triggered from the menu")

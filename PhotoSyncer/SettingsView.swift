@@ -137,8 +137,20 @@ private struct GeneralTab: View {
     var body: some View {
         Form {
             Section("Schedule") {
-                Picker("Check for new photos every", selection: $syncer.interval) {
-                    ForEach(SyncInterval.allCases) { Text($0.label).tag($0) }
+                Picker("Sync schedule", selection: $syncer.scheduleMode) {
+                    ForEach(SyncScheduleMode.allCases) { Text($0.label).tag($0) }
+                }
+                switch syncer.scheduleMode {
+                case .interval:
+                    Picker("Check for new photos every", selection: $syncer.interval) {
+                        ForEach(SyncInterval.allCases) { Text($0.label).tag($0) }
+                    }
+                case .daily:
+                    DatePicker("Sync daily at", selection: $syncer.dailySyncDate, displayedComponents: .hourAndMinute)
+                    Toggle("Catch up on wake if Mac was asleep at scheduled time", isOn: $syncer.dailyCatchUpIfMissed)
+                    Text(syncer.dailyScheduleSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
