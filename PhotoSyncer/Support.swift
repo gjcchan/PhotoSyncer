@@ -7,6 +7,8 @@ import UniformTypeIdentifiers
 import AppKit
 import Network
 import CryptoKit
+import IOKit
+import IOKit.pwr_mgt
 
 enum SyncScheduleMode: String, CaseIterable, Identifiable {
     case interval
@@ -918,4 +920,65 @@ nonisolated final class InstanceLock: @unchecked Sendable {
     }
 
     deinit { release() }
+}
+
+/// Holds both `NetworkClientActive` (required to keep macOS awake across RTC timer / Dark Wake sessions)
+/// and `PreventUserIdleSystemSleep` (prevents idle sleep during interactive sessions), bounded by a
+/// kernel-enforced `TimeoutActionRelease` safety timeout so a stalled task can never hold power forever.
+nonisolated final class PowerAssertion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ids: [IOPMAssertionID] = []
+    let lastReturnCode: IOReturn
+
+    init(name: String, details: String? = nil, timeout: TimeInterval = 7200) {
+        let clampedTimeout = max(timeout, 1)
+        var lastKR: IOReturn = kIOReturnError
+        for type in ["NetworkClientActive", "PreventUserIdleSystemSleep"] {
+            var id = IOPMAssertionID(kIOPMNullAssertionID)
+            let kr = IOPMAssertionCreateWithDescription(
+                type as CFString,
+                name as CFString,
+                details as CFString?,
+                nil,
+                nil,
+                clampedTimeout,
+                "TimeoutActionRelease" as CFString,
+                &id
+            )
+            lastKR = kr
+            if kr == kIOReturnSuccess, id != IOPMAssertionID(kIOPMNullAssertionID) {
+                ids.append(id)
+            }
+        }
+        lastReturnCode = ids.isEmpty ? lastKR : kIOReturnSuccess
+    }
+
+    var isActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !ids.isEmpty
+    }
+
+    func release() {
+        lock.lock()
+        let toRelease = ids
+        ids.removeAll()
+        lock.unlock()
+        for id in toRelease {
+            _ = IOPMAssertionRelease(id)
+        }
+    }
+
+    deinit { release() }
+
+    /// Wakes the display / WindowServer out of Dark Wake so system confirmation alerts can render on screen.
+    static func declareUserActivity(reason: String) -> IOPMAssertionID? {
+        var id = IOPMAssertionID(kIOPMNullAssertionID)
+        let kr = IOPMAssertionDeclareUserActivity(reason as CFString, kIOPMUserActiveLocal, &id)
+        return (kr == kIOReturnSuccess && id != IOPMAssertionID(kIOPMNullAssertionID)) ? id : nil
+    }
+
+    static func releaseAssertion(_ id: IOPMAssertionID?) {
+        guard let id, id != IOPMAssertionID(kIOPMNullAssertionID) else { return }
+        _ = IOPMAssertionRelease(id)
+    }
 }

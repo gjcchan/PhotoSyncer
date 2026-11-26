@@ -222,6 +222,9 @@ final class SyncEngine: ObservableObject {
     private var schedulerTask: Task<Void, Never>?
     let cloudClock = CloudCountdown()
     let autoConfirm = DeleteAutoConfirmController()
+    let wakeScheduler = SystemWakeScheduler()
+    private var wakeAssertion: PowerAssertion?
+    private var wakeSettleTask: Task<Void, Never>?
     private var clockTask: Task<Void, Never>?
     private var lastClockTick = Date.distantPast
     private var photosFallbackBlockedUntil = Date.distantPast
@@ -269,12 +272,19 @@ final class SyncEngine: ObservableObject {
         }
         let dayLabel = Calendar.current.isDateInToday(next) ? "Today" : "Tomorrow"
         let timeStr = next.formatted(date: .omitted, time: .shortened)
+        let wakeConfigured = wakeScheduler.wakeEnabled && wakeScheduler.isConfigured(forSyncMinutes: dailySyncMinutes)
         if dailyCatchUpIfMissed {
+            if wakeConfigured {
+                return "Next scheduled sync: \(dayLabel) at \(timeStr) (Mac wakes at \(wakeScheduler.formattedWakeTime(forSyncMinutes: dailySyncMinutes)))."
+            }
             return "Next scheduled sync: \(dayLabel) at \(timeStr)."
         }
         let endMin = DailySchedule.clampMinutes(dailySyncMinutes + DailySchedule.windowMinutes)
         let endStr = (Calendar.current.date(bySettingHour: endMin / 60, minute: endMin % 60, second: 0, of: now) ?? now)
             .formatted(date: .omitted, time: .shortened)
+        if wakeConfigured {
+            return "Next scheduled sync: \(dayLabel) between \(timeStr) and \(endStr) (Mac wakes at \(wakeScheduler.formattedWakeTime(forSyncMinutes: dailySyncMinutes)))."
+        }
         return "Next scheduled sync: \(dayLabel) between \(timeStr) and \(endStr) (skipped if Mac is asleep)."
     }
 
@@ -524,12 +534,20 @@ final class SyncEngine: ObservableObject {
     // MARK: Sleep / wake / drives / termination
     private func systemWillSleep() {
         sleepPause = true      // the run stops after the current item instead of fighting the sleep
+        wakeSettleTask?.cancel()
+        wakeSettleTask = nil
+        wakeAssertion?.release()
+        wakeAssertion = nil
         if isSyncing { log.info("System going to sleep; sync will pause after the current item") }
     }
 
     private func systemWillPowerOff() {
         guard !isTerminating else { return }
         isTerminating = true
+        wakeSettleTask?.cancel()
+        wakeSettleTask = nil
+        wakeAssertion?.release()
+        wakeAssertion = nil
         if isSyncing {
             needsResume = true
             store.save()
@@ -543,6 +561,10 @@ final class SyncEngine: ObservableObject {
         isTerminating = true
         schedulerTask?.cancel()
         clockTask?.cancel()
+        wakeSettleTask?.cancel()
+        wakeSettleTask = nil
+        wakeAssertion?.release()
+        wakeAssertion = nil
         store.save()
         instanceLock.release()
     }
@@ -553,6 +575,10 @@ final class SyncEngine: ObservableObject {
         isTerminating = true
         schedulerTask?.cancel()
         clockTask?.cancel()
+        wakeSettleTask?.cancel()
+        wakeSettleTask = nil
+        wakeAssertion?.release()
+        wakeAssertion = nil
 
         if !isSyncing, activeTask == nil {
             store.save()
@@ -611,14 +637,58 @@ final class SyncEngine: ObservableObject {
     }
 
     private func systemDidWake() {
+        wakeSettleTask?.cancel()
+        wakeAssertion?.release()
+        // Hold NetworkClientActive immediately so an RTC timer / Dark Wake does not go back to sleep
+        // during the 30 s drive/Wi-Fi settle or in the final seconds before the scheduled sync minute.
+        let assertion = PowerAssertion(
+            name: "PhotoSyncer post-wake settle",
+            details: "Waiting for drives and network before scheduled sync",
+            timeout: 180
+        )
+        wakeAssertion = assertion
         wakeSettleUntil = Date().addingTimeInterval(30)
         log.info("System woke; waiting 30 s for drives and network before syncing")
-        Task { [weak self] in
+
+        wakeSettleTask = Task { [weak self] in
+            defer {
+                assertion.release()
+                if let self, self.wakeAssertion === assertion {
+                    self.wakeAssertion = nil
+                }
+            }
             try? await Task.sleep(for: .seconds(31))
-            guard let self else { return }
+            guard let self, !Task.isCancelled, !self.isTerminating else { return }
             self.sleepPause = false
             self.runBackoffUntil = .distantPast        // a pre-sleep backoff no longer applies
             await self.tick()
+
+            // When macOS woke 1 minute early for a daily scheduled sync (e.g. 2:59 AM for 3:00 AM),
+            // bridge the remaining seconds until the exact sync minute arrives before releasing wakeAssertion.
+            if !self.isSyncing,
+               !self.isPaused,
+               !self.isTerminating,
+               !self.sleepPause,
+               self.scheduleMode == .daily,
+               let next = DailySchedule.nextOccurrence(after: Date(), targetMinutes: self.dailySyncMinutes) {
+                let delay = next.timeIntervalSinceNow
+                if delay > 0 && delay <= 120 {
+                    try? await Task.sleep(for: .seconds(delay + 0.5))
+                    guard !Task.isCancelled, !self.isTerminating, !self.sleepPause else { return }
+                    await self.tick()
+                }
+            }
+
+            // If Wi-Fi / DHCP is still finishing association right after wake, give it one extra 15 s check.
+            if !self.isSyncing,
+               self.deferredReason != nil,
+               !Task.isCancelled,
+               !self.isTerminating,
+               !self.sleepPause {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled, !self.isTerminating, !self.sleepPause else { return }
+                await self.tick()
+            }
         }
     }
 
@@ -973,6 +1043,7 @@ final class SyncEngine: ObservableObject {
         needsPhotosSettings = false
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Deleting synced photos from iCloud")
+        let powerAssertion = PowerAssertion(name: "PhotoSyncer deleting verified iCloud items", timeout: 7200)
 
         activeTask = Task {
             do {
@@ -1019,6 +1090,7 @@ final class SyncEngine: ObservableObject {
             let finished = active
             active = []
             for rt in finished { await rt.backend.close() }
+            powerAssertion.release()
             ProcessInfo.processInfo.endActivity(activity)
             isSyncing = false
             phase = nil
@@ -1040,6 +1112,7 @@ final class SyncEngine: ObservableObject {
         lastError = nil
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Verifying destination files")
+        let powerAssertion = PowerAssertion(name: "PhotoSyncer verifying destination files", timeout: 7200)
 
         activeTask = Task {
             var checked = 0
@@ -1113,6 +1186,7 @@ final class SyncEngine: ObservableObject {
             let finished = active
             active = []
             for rt in finished { await rt.backend.close() }
+            powerAssertion.release()
             ProcessInfo.processInfo.endActivity(activity)
             isSyncing = false
             phase = nil
@@ -1250,9 +1324,10 @@ final class SyncEngine: ObservableObject {
         isSyncing = true; done = 0; total = 0; phase = nil; lastError = nil; needsPhotosSettings = false
         needsAutomationSettings = false; photosFallbackFailures = 0; previewsSaved = 0
         let force = defaults.bool(forKey: "forceReconcile")
-        // Keep the Mac awake and un-throttled while syncing.
+        // Keep the Mac awake (including across RTC Dark Wake) and un-throttled while syncing.
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Syncing photos")
+        let powerAssertion = PowerAssertion(name: "PhotoSyncer syncing photos", timeout: 7200)
 
         activeTask = Task {
             do {
@@ -1283,6 +1358,7 @@ final class SyncEngine: ObservableObject {
             let finished = active
             active = []
             for rt in finished { await rt.backend.close() }
+            powerAssertion.release()
             ProcessInfo.processInfo.endActivity(activity)
             isSyncing = false
             phase = nil

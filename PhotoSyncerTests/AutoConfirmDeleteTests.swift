@@ -249,4 +249,54 @@ struct AutoConfirmDeleteTests {
             calendar: cal
         ) == false)
     }
+
+    @Test func autoWakeConfigBuildsPMSetCommandsAndPreservesPowerOffSchedules() {
+        // 1-minute early wake lead time (including midnight wraparound).
+        #expect(AutoWakeConfig.wakeMinutes(forSyncMinutes: 180) == 179)
+        #expect(AutoWakeConfig.formatPMSetTime(AutoWakeConfig.wakeMinutes(forSyncMinutes: 180)) == "02:59:00")
+        #expect(AutoWakeConfig.wakeMinutes(forSyncMinutes: 0) == 1439)
+        #expect(AutoWakeConfig.formatPMSetTime(AutoWakeConfig.wakeMinutes(forSyncMinutes: 0)) == "23:59:00")
+
+        // Parse AutoWake.plist with both RepeatingPowerOn and RepeatingPowerOff (Mon–Fri 10:30 PM sleep).
+        let plist: [String: Any] = [
+            "RepeatingPowerOn": [
+                "eventtype": "wake",
+                "time": 179,
+                "weekdays": 127,
+            ],
+            "RepeatingPowerOff": [
+                "eventtype": "sleep",
+                "time": 22 * 60 + 30,
+                "weekdays": 31,   // M(1)+T(2)+W(4)+R(8)+F(16) = MTWRF
+            ],
+        ]
+        let state = AutoWakeConfig.parsePlist(plist)
+        #expect(AutoWakeConfig.isDailyWakeInstalled(state, forSyncMinutes: 180) == true)
+        #expect(AutoWakeConfig.isDailyWakeInstalled(state, forSyncMinutes: 240) == false)
+        #expect(state.powerOff == AutoWakeConfig.Entry(eventType: "sleep", weekdays: 31, timeMinutes: 1350))
+
+        // Enabling without an existing power-off schedule.
+        #expect(AutoWakeConfig.pmsetArguments(enableWakeForSyncMinutes: 180, preservingPowerOff: nil)
+            == ["repeat", "wake", "MTWRFSU", "02:59:00"])
+
+        // Enabling while preserving an existing RepeatingPowerOff entry.
+        #expect(AutoWakeConfig.pmsetArguments(enableWakeForSyncMinutes: 180, preservingPowerOff: state.powerOff)
+            == ["repeat", "wake", "MTWRFSU", "02:59:00", "sleep", "MTWRF", "22:30:00"])
+
+        // Disabling while preserving an existing RepeatingPowerOff entry vs. cancelling outright.
+        #expect(AutoWakeConfig.pmsetArguments(enableWakeForSyncMinutes: nil, preservingPowerOff: state.powerOff)
+            == ["repeat", "sleep", "MTWRF", "22:30:00"])
+        #expect(AutoWakeConfig.pmsetArguments(enableWakeForSyncMinutes: nil, preservingPowerOff: nil)
+            == ["repeat", "cancel"])
+
+        // Live IOKit Dark-Wake + Idle-Sleep power assertion creation & idempotent release.
+        let assertion = PowerAssertion(name: "PhotoSyncer unit test", timeout: 10)
+        if assertion.lastReturnCode == 0 {
+            #expect(assertion.isActive == true)
+        }
+        assertion.release()
+        #expect(assertion.isActive == false)
+        assertion.release()
+        #expect(assertion.isActive == false)
+    }
 }

@@ -568,6 +568,13 @@ final class DeleteAutoConfirmController: ObservableObject {
             try await deletionBlock()
             return
         }
+        // If the Mac woke via an RTC schedule into Dark Wake, wake WindowServer / display briefly
+        // so macOS renders the PhotoKit confirmation dialog for Accessibility inspection.
+        let displayAssertion = PowerAssertion.declareUserActivity(reason: "PhotoSyncer scheduled iCloud delete")
+        defer { PowerAssertion.releaseAssertion(displayAssertion) }
+        if CGDisplayIsAsleep(CGMainDisplayID()) != 0 {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
         let appName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
             ?? "PhotoSyncer"

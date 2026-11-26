@@ -9,11 +9,11 @@ Requires MacOS, use at your own risk.
 - **Grant Photos Access**: Allow PhotoSyncer full access to your Photos library (**System Settings › Privacy & Security › Photos**), as it relies on macOS Photos to retrieve your photos and videos.
 - **Download Originals in Photos**: In the **Photos** app, go to **Photos › Settings › iCloud** and select **Download Originals to this Mac** so full-resolution originals are available to sync.
 - **Automation (Optional Fallback)**: If PhotoKit cannot download an iCloud original directly, PhotoSyncer can ask the **Photos** app to export it via AppleScript. If prompted, allow PhotoSyncer to control **Photos** in **System Settings › Privacy & Security › Automation**.
-- **Other Optional Prompts**: Enabling **Launch at Login** may prompt for approval under **System Settings › General › Login Items**, and connecting to a LAN NAS, SMB, or SFTP server may prompt for **Local Network** access. Destination folder access is granted automatically when you pick a folder.
+- **Other Optional Prompts**: Enabling **Launch at Login** may prompt for approval under **System Settings › General › Login Items**, enabling **Wake Mac from sleep for scheduled sync** asks once for Administrator approval to configure macOS's `pmset` wake timer, and connecting to a LAN NAS, SMB, or SFTP server may prompt for **Local Network** access. Destination folder access is granted automatically when you pick a folder.
 
 ## Features
 
-- **Menu-Bar Background Sync**: Runs quietly from the macOS menu bar on a configurable schedule (every 1, 4, 12, or 24 hours, or daily at a set time) with Launch at Login, Pause/Resume, live status and deletion-queue (`count (size)`) readout, and recovery across sleep/wake, network changes, and drive reconnects.
+- **Menu-Bar Background Sync**: Runs quietly from the macOS menu bar on a configurable schedule (every 1, 4, 12, or 24 hours, or daily at a set time with optional macOS wake-from-sleep) with Launch at Login, Pause/Resume, live status and deletion-queue (`count (size)`) readout, and recovery across sleep/wake, network changes, and drive reconnects.
 - **Full Library Asset Support**: Exports original photos and videos along with edited renders, RAW/JPEG pairs, and Live Photo paired videos.
 - **Multiple Destinations (Folders, SMB & SFTP)**: Syncs to local disks, USB drives, mounted NAS shares (via security-scoped bookmarks), SMB network shares (via macOS's built-in SMB client with Keychain-stored passwords or guest access), and SFTP servers (with Keychain-stored passwords and trust-on-first-use SSH host-key pinning).
 - **Cross-Destination Sync**: Optional copy-only mirroring keeps multiple destinations eventually consistent by copying missing files between them based on SHA-256 content hashes.

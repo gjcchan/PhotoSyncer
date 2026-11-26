@@ -145,8 +145,10 @@ private struct GeneralTab: View {
                     Picker("Check for new photos every", selection: $syncer.interval) {
                         ForEach(SyncInterval.allCases) { Text($0.label).tag($0) }
                     }
+                    OrphanedWakeTimerRow(scheduler: syncer.wakeScheduler)
                 case .daily:
                     DatePicker("Sync daily at", selection: $syncer.dailySyncDate, displayedComponents: .hourAndMinute)
+                    SystemWakeSettingsRows(scheduler: syncer.wakeScheduler, syncMinutes: syncer.dailySyncMinutes)
                     Toggle("Catch up on wake if Mac was asleep at scheduled time", isOn: $syncer.dailyCatchUpIfMissed)
                     Text(syncer.dailyScheduleSummary)
                         .font(.caption)
