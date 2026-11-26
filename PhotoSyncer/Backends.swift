@@ -102,25 +102,28 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
     }
 
     func upload(local: URL, as name: String, size: UInt64, hash: String, date: Date?) async throws {
-        let fm = FileManager.default
-        for candidate in [".\(name).partial", "\(name).partial"] {
-            let existingPartial = url.appendingPathComponent(candidate)
-            if unlink(existingPartial.path) == 0 {
-                await MainActor.run {
-                    EventLog.shared.info("Removed existing partial file \(candidate); re-copying \(name)")
-                }
+        let dir = url
+        let token = UUID().uuidString.prefix(8)
+        let partial = dir.appendingPathComponent(".\(name).\(token).partial")
+        let final = dir.appendingPathComponent(name)
+        var renamed = false
+        defer {
+            if !renamed {
+                let path = partial.path
+                Task.detached(priority: .utility) { _ = unlink(path) }
             }
         }
-        let partial = url.appendingPathComponent(".\(name).partial")
-        defer { try? fm.removeItem(at: partial) }       // no-op after the rename
         try await VerifiedCopy.copy(from: local, to: partial, expectedHash: hash, expectedSize: size)
-        if let date {
-            // Some NAS filesystems refuse this; the file itself is fine.
-            try? fm.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: partial.path)
-        }
-        let final = url.appendingPathComponent(name)
         do {
-            try fm.moveItem(at: partial, to: final)
+            try await Task.detached {
+                let fm = FileManager.default
+                if let date {
+                    // Some NAS filesystems refuse this; the file itself is fine.
+                    try? fm.setAttributes([.creationDate: date, .modificationDate: date], ofItemAtPath: partial.path)
+                }
+                try fm.moveItem(at: partial, to: final)
+            }.value
+            renamed = true
         } catch {
             let ns = error as NSError
             let isExist = (ns.domain == NSCocoaErrorDomain && ns.code == NSFileWriteFileExistsError)
@@ -198,6 +201,178 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
 }
 
 // MARK: - Shared helpers
+
+/// Bounded FIFO pool of reusable async connections/channels (e.g. multiplexed `SFTPClient` subsystem
+/// channels over a single authenticated SSH connection).
+actor AsyncResourcePool<Resource: Sendable> {
+    private var idle: [Resource]
+    private var all: [Resource]
+    private var closed = false
+    private var waiters: [CheckedContinuation<Resource?, Never>] = []
+    nonisolated let capacity: Int
+
+    init(_ resources: [Resource]) {
+        self.idle = resources
+        self.all = resources
+        self.capacity = resources.count
+    }
+
+    func withResource<T: Sendable>(
+        unavailableError: Error = SyncError.destinationUnavailable("Not connected to the SFTP server"),
+        _ body: @Sendable (Resource) async throws -> T
+    ) async throws -> T {
+        guard let res = await checkout() else {
+            throw unavailableError
+        }
+        defer { checkin(res) }
+        return try await body(res)
+    }
+
+    private func checkout() async -> Resource? {
+        if closed || all.isEmpty { return nil }
+        if !idle.isEmpty {
+            return idle.removeFirst()
+        }
+        return await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+
+    private func checkin(_ res: Resource) {
+        if closed { return }
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.resume(returning: res)
+        } else {
+            idle.append(res)
+        }
+    }
+
+    func drainForClose() -> [Resource] {
+        closed = true
+        idle.removeAll()
+        let owned = all
+        all.removeAll()
+        let pending = waiters
+        waiters.removeAll()
+        for w in pending { w.resume(returning: nil) }
+        return owned
+    }
+}
+
+/// Sliding-window pipelined chunk writer (e.g. keeping 8 × 32 KB `SSH_FXP_WRITE` packets in flight
+/// continuously instead of waiting a full network RTT per 32 KB packet).
+nonisolated enum PipelinedChunkWriter {
+    static func writeAll(
+        from handle: FileHandle,
+        chunkSize: Int = 32_000,
+        windowDepth: Int = 8,
+        sendSlice: @escaping @Sendable (UInt64, Data) async throws -> Void
+    ) async throws -> UInt64 {
+        let step = max(chunkSize, 1)
+        let depth = max(windowDepth, 1)
+        var nextOffset: UInt64 = 0
+        var reachedEOF = false
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            func enqueueNext() throws -> Bool {
+                guard !reachedEOF else { return false }
+                guard let chunk = try handle.read(upToCount: step), !chunk.isEmpty else {
+                    reachedEOF = true
+                    return false
+                }
+                let offset = nextOffset
+                nextOffset += UInt64(chunk.count)
+                group.addTask {
+                    try await sendSlice(offset, chunk)
+                }
+                return true
+            }
+
+            for _ in 0..<depth {
+                if !(try enqueueNext()) { break }
+            }
+            while try await group.next() != nil {
+                _ = try enqueueNext()
+            }
+        }
+        return nextOffset
+    }
+}
+
+/// Sliding-window pipelined chunk reader that keeps `windowDepth` (`8` × 32 KB) read requests in flight
+/// concurrently while delivering bytes to `onOrderedChunk` (e.g. `SHA256` or `FileHandle`) in strict
+/// sequential offset order with bounded memory (`<= windowDepth * chunkSize`).
+nonisolated enum PipelinedChunkReader {
+    static func readOrdered(
+        totalSize: UInt64,
+        chunkSize: UInt32 = 32_000,
+        windowDepth: Int = 8,
+        fetchChunk: @escaping @Sendable (UInt64, UInt32) async throws -> Data,
+        onOrderedChunk: (Data) throws -> Void
+    ) async throws -> UInt64 {
+        guard totalSize > 0 else { return 0 }
+        let step = UInt64(max(chunkSize, 1))
+        let depth = max(windowDepth, 1)
+        let totalSlots = Int((totalSize + step - 1) / step)
+
+        var nextToLaunch = 0
+        var nextToEmit = 0
+        var ready: [Int: Data] = [:]
+        var hitEarlyEOF = false
+        var totalDelivered: UInt64 = 0
+
+        try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+            func launchSlot() {
+                guard !hitEarlyEOF, nextToLaunch < totalSlots else { return }
+                let slot = nextToLaunch
+                nextToLaunch += 1
+                let start = UInt64(slot) * step
+                let want = UInt32(min(step, totalSize - start))
+
+                group.addTask {
+                    var collected = Data()
+                    collected.reserveCapacity(Int(want))
+                    var curOffset = start
+                    var remaining = want
+                    while remaining > 0 {
+                        let part = try await fetchChunk(curOffset, remaining)
+                        if part.isEmpty { break }
+                        collected.append(part)
+                        let got = UInt32(min(part.count, Int(remaining)))
+                        curOffset += UInt64(got)
+                        remaining -= got
+                    }
+                    return (slot, collected)
+                }
+            }
+
+            for _ in 0..<min(depth, totalSlots) {
+                launchSlot()
+            }
+
+            while let (slot, data) = try await group.next() {
+                ready[slot] = data
+                while let chunk = ready.removeValue(forKey: nextToEmit) {
+                    if !chunk.isEmpty {
+                        try onOrderedChunk(chunk)
+                        totalDelivered += UInt64(chunk.count)
+                    }
+                    let expectedSlotLen = Int(min(step, totalSize - UInt64(nextToEmit) * step))
+                    if chunk.count < expectedSlotLen {
+                        hitEarlyEOF = true
+                    }
+                    nextToEmit += 1
+                    if hitEarlyEOF { break }
+                }
+                if !hitEarlyEOF {
+                    launchSlot()
+                }
+            }
+        }
+        return totalDelivered
+    }
+}
 
 /// Gives up on an operation that stops responding instead of hanging the whole sync.
 nonisolated func withTimeout<T: Sendable>(_ seconds: TimeInterval,

@@ -755,17 +755,26 @@ nonisolated final class ErrorBox: @unchecked Sendable {
 }
 
 nonisolated enum FileHash {
-    /// SHA-256 of a file. `noCache` bypasses the OS file cache so the bytes are actually
-    /// re-read from the (possibly network) volume instead of served from memory.
-    static func sha256(of url: URL, noCache: Bool = false) async throws -> String {
+    /// SHA-256 and byte count of a file in a single open/read pass. `noCache` bypasses the OS file
+    /// cache so the bytes are actually re-read from the (possibly network) volume instead of memory.
+    static func sha256AndSize(of url: URL, noCache: Bool = false) async throws -> (hash: String, size: UInt64) {
         try await Task.detached {
             let h = try FileHandle(forReadingFrom: url)
             defer { try? h.close() }
             if noCache { _ = fcntl(h.fileDescriptor, F_NOCACHE, 1) }
             var hasher = SHA256()
-            while let chunk = try h.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
-            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            var total: UInt64 = 0
+            while let chunk = try h.read(upToCount: 1 << 20), !chunk.isEmpty {
+                hasher.update(data: chunk)
+                total += UInt64(chunk.count)
+            }
+            let hex = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            return (hex, total)
         }.value
+    }
+
+    static func sha256(of url: URL, noCache: Bool = false) async throws -> String {
+        (try await sha256AndSize(of: url, noCache: noCache)).hash
     }
 
     static func size(of url: URL) -> UInt64? {
@@ -779,11 +788,18 @@ nonisolated enum FileHash {
 nonisolated enum VerifiedCopy {
     static func copy(from src: URL, to dst: URL, expectedHash: String, expectedSize: UInt64) async throws {
         try await Task.detached {
-            guard FileManager.default.createFile(atPath: dst.path, contents: nil) else {
+            let outFD = Darwin.open(dst.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
+            guard outFD >= 0 else {
                 throw SyncError.message("Cannot create a file in the destination folder")
             }
-            let inH = try FileHandle(forReadingFrom: src)
-            let outH = try FileHandle(forWritingTo: dst)
+            let outH = FileHandle(fileDescriptor: outFD, closeOnDealloc: false)
+            let inH: FileHandle
+            do {
+                inH = try FileHandle(forReadingFrom: src)
+            } catch {
+                try? outH.close()
+                throw error
+            }
             var written: UInt64 = 0
             do {
                 while let chunk = try inH.read(upToCount: 1 << 20), !chunk.isEmpty {
@@ -799,10 +815,13 @@ nonisolated enum VerifiedCopy {
                 throw error
             }
 
-            guard written == expectedSize, FileHash.size(of: dst) == expectedSize else {
+            guard written == expectedSize else {
                 throw SyncError.message("Copy verification failed: size mismatch")
             }
-            let readBack = try await FileHash.sha256(of: dst, noCache: true)
+            let (readBack, readSize) = try await FileHash.sha256AndSize(of: dst, noCache: true)
+            guard readSize == expectedSize else {
+                throw SyncError.message("Copy verification failed: size mismatch")
+            }
             guard readBack == expectedHash else {
                 throw SyncError.message("Copy verification failed: checksum mismatch")
             }
@@ -980,5 +999,149 @@ nonisolated final class PowerAssertion: @unchecked Sendable {
     static func releaseAssertion(_ id: IOPMAssertionID?) {
         guard let id, id != IOPMAssertionID(kIOPMNullAssertionID) else { return }
         _ = IOPMAssertionRelease(id)
+    }
+}
+
+// MARK: - Concurrent Sync Coordination
+
+/// Tracks committed and in-flight reserved filenames for a single destination so concurrent workers
+/// never pick the same target filename (case-insensitively, NFC/NFD-normalized).
+nonisolated struct DestinationNameBook: Sendable {
+    private(set) var names: Set<String>
+    private(set) var actualNames: [String: String]
+    private(set) var sizes: [String: UInt64]
+    private(set) var reservedNames: Set<String> = []
+
+    init(listing: [RemoteFile]) {
+        names = Set(listing.map { FileNames.key($0.name) })
+        actualNames = Dictionary(listing.map { (FileNames.key($0.name), $0.name) }, uniquingKeysWith: { a, _ in a })
+        sizes = Dictionary(listing.map { (FileNames.key($0.name), $0.size) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    func isOccupied(_ name: String) -> Bool {
+        let k = FileNames.key(name)
+        return names.contains(k) || reservedNames.contains(k)
+    }
+
+    /// Returns `(actualName, size)` if `name` is already committed on disk and not currently being
+    /// inspected/written by another worker.
+    func unreservedExisting(_ name: String) -> (actualName: String, size: UInt64)? {
+        let k = FileNames.key(name)
+        guard names.contains(k), !reservedNames.contains(k) else { return nil }
+        return (actualNames[k] ?? name, sizes[k] ?? 0)
+    }
+
+    @discardableResult
+    mutating func reserve(_ name: String) -> Bool {
+        let k = FileNames.key(name)
+        guard !names.contains(k), !reservedNames.contains(k) else { return false }
+        reservedNames.insert(k)
+        return true
+    }
+
+    /// Temporarily locks an existing committed filename while a worker hashes it for adoption,
+    /// preventing a second worker from simultaneously hashing or colliding with it.
+    mutating func lockExistingForInspection(_ name: String) -> Bool {
+        let k = FileNames.key(name)
+        guard names.contains(k), !reservedNames.contains(k) else { return false }
+        reservedNames.insert(k)
+        return true
+    }
+
+    mutating func releaseReservation(_ name: String) {
+        reservedNames.remove(FileNames.key(name))
+    }
+
+    mutating func commitFile(name: String, size: UInt64) {
+        let k = FileNames.key(name)
+        reservedNames.remove(k)
+        names.insert(k)
+        actualNames[k] = name
+        sizes[k] = size
+    }
+
+    mutating func removeFile(name: String) {
+        let k = FileNames.key(name)
+        reservedNames.remove(k)
+        names.remove(k)
+        actualNames[k] = nil
+        sizes[k] = nil
+    }
+}
+
+/// FIFO worker + byte-budget limiter for concurrent photo/video staging and SMB uploads.
+/// Allows up to `maxWorkers` items concurrently while `inFlightBytes <= maxInFlightBytes`,
+/// always admitting a single oversized video solo (`inFlightCount == 0`) so large files never deadlock
+/// and never thrash NAS spinning disks alongside other large transfers.
+actor SyncPipelineGate {
+    nonisolated static let defaultMaxWorkers = 4
+    nonisolated static let defaultMaxInFlightBytes: Int64 = 512_000_000   // 512 MB cap on concurrent staged bytes
+
+    private let maxWorkers: Int
+    private let maxInFlightBytes: Int64
+    private(set) var inFlightCount = 0
+    private(set) var inFlightBytes: Int64 = 0
+    private var waiters: [(bytes: Int64, cont: CheckedContinuation<Void, Never>)] = []
+
+    init(maxWorkers: Int = SyncPipelineGate.defaultMaxWorkers,
+         maxInFlightBytes: Int64 = SyncPipelineGate.defaultMaxInFlightBytes) {
+        self.maxWorkers = max(1, maxWorkers)
+        self.maxInFlightBytes = max(1, maxInFlightBytes)
+    }
+
+    private func canAdmit(bytes: Int64) -> Bool {
+        guard inFlightCount < maxWorkers else { return false }
+        if inFlightCount == 0 { return true }
+        return inFlightBytes + bytes <= maxInFlightBytes
+    }
+
+    func acquire(bytes: Int64) async {
+        let cost = max(bytes, 1)
+        if waiters.isEmpty && canAdmit(bytes: cost) {
+            inFlightCount += 1
+            inFlightBytes += cost
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            waiters.append((cost, cont))
+        }
+    }
+
+    func release(bytes: Int64) {
+        let cost = max(bytes, 1)
+        inFlightCount = max(0, inFlightCount - 1)
+        inFlightBytes = max(0, inFlightBytes - cost)
+        while let first = waiters.first, canAdmit(bytes: first.bytes) {
+            waiters.removeFirst()
+            inFlightCount += 1
+            inFlightBytes += first.bytes
+            first.cont.resume()
+        }
+    }
+}
+
+/// Coordinates simultaneous workers that happen to stage byte-identical content (same SHA-256)
+/// for the same destination, so the second worker awaits the first instead of uploading a duplicate.
+@MainActor
+final class InFlightHashGate {
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func waitIfInFlight(key: String) async -> Bool {
+        guard waiters[key] != nil else { return false }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            waiters[key, default: []].append(cont)
+        }
+        return true
+    }
+
+    func begin(key: String) {
+        if waiters[key] == nil {
+            waiters[key] = []
+        }
+    }
+
+    func end(key: String) {
+        let list = waiters.removeValue(forKey: key) ?? []
+        for cont in list { cont.resume() }
     }
 }

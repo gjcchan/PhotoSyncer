@@ -12,36 +12,81 @@ private final class DestRuntime {
     let dest: Destination
     let backend: DestinationBackend
     var listing: [RemoteFile]
-    var names: Set<String>                 // normalized names currently present
-    var actualNames: [String: String]      // normalized key -> actual filename on destination
-    var sizes: [String: UInt64]
+    var nameBook: DestinationNameBook
+    let hashGate = InFlightHashGate()
     var unavailable = false                // went offline / was skipped during this run
+
+    private var cachedFreeBytes: Int64?
+    private var freeSpaceKnown: Bool?
+    private var inFlightReservedBytes: Int64 = 0
+    private var probesCountdown = 0
 
     var key: String { dest.key }
     var name: String { dest.name }
+    var names: Set<String> { nameBook.names }
+    var actualNames: [String: String] { nameBook.actualNames }
+    var sizes: [String: UInt64] { nameBook.sizes }
 
     init(dest: Destination, backend: DestinationBackend, listing: [RemoteFile]) {
         self.dest = dest
         self.backend = backend
         self.listing = listing
-        names = Set(listing.map { FileNames.key($0.name) })
-        actualNames = Dictionary(listing.map { (FileNames.key($0.name), $0.name) }, uniquingKeysWith: { a, _ in a })
-        sizes = Dictionary(listing.map { (FileNames.key($0.name), $0.size) }, uniquingKeysWith: { a, _ in a })
+        self.nameBook = DestinationNameBook(listing: listing)
     }
 
     func recordFile(name: String, size: UInt64) {
-        let k = FileNames.key(name)
-        names.insert(k)
-        actualNames[k] = name
-        sizes[k] = size
+        nameBook.commitFile(name: name, size: size)
+    }
+
+    func releaseReservation(name: String) {
+        nameBook.releaseReservation(name)
     }
 
     func removeFile(name: String) {
-        let k = FileNames.key(name)
-        names.remove(k)
-        actualNames[k] = nil
-        sizes[k] = nil
+        nameBook.removeFile(name: name)
     }
+
+    /// Checks destination capacity (caching `freeSpace()` across up to 25 uploads while healthy so SMB
+    /// isn't hit with `statfs` on every single photo, switching to per-item checks below 1 GB free)
+    /// and reserves `estimatedBytes` across concurrent workers.
+    func reserveSpace(estimatedBytes: Int64) async -> Bool {
+        let needed = max(estimatedBytes, 0)
+        let reserveMargin: Int64 = 200_000_000
+        let lowSpaceThreshold: Int64 = 1_000_000_000
+        let shouldProbe = freeSpaceKnown == nil
+            || probesCountdown <= 0
+            || (cachedFreeBytes.map { ($0 - inFlightReservedBytes) < needed + lowSpaceThreshold } ?? false)
+        if shouldProbe {
+            if let fresh = await backend.freeSpace() {
+                cachedFreeBytes = fresh
+                freeSpaceKnown = true
+            } else {
+                cachedFreeBytes = nil
+                freeSpaceKnown = false
+            }
+            probesCountdown = 25
+        } else {
+            probesCountdown -= 1
+        }
+        if let free = cachedFreeBytes, (free - inFlightReservedBytes) < needed + reserveMargin {
+            return false
+        }
+        inFlightReservedBytes += needed
+        return true
+    }
+
+    func settleSpace(reservedBytes: Int64, writtenBytes: Int64) {
+        inFlightReservedBytes = max(0, inFlightReservedBytes - max(reservedBytes, 0))
+        if let free = cachedFreeBytes, writtenBytes > 0 {
+            cachedFreeBytes = max(0, free - writtenBytes)
+        }
+    }
+}
+
+/// Tracks hashes placed during a single asset's export so Live Photo / edit parts of the same asset
+/// aren't miscounted as library duplicates, without sharing mutable state across concurrent workers.
+private final class AttemptTracker {
+    var markers = Set<String>()
 }
 
 /// One failed / iCloud-waiting item, as shown in Settings › Activity (or › Failed once parked).
@@ -229,7 +274,7 @@ final class SyncEngine: ObservableObject {
     private var lastClockTick = Date.distantPast
     private var photosFallbackBlockedUntil = Date.distantPast
     private var observers: [NSObjectProtocol] = []
-    private var attemptHashes = Set<String>()       // "dest:hash" written while syncing the current asset (not duplicates)
+    private var inFlightLocalBytes: Int64 = 0       // staged bytes reserved across concurrent workers
     private var sleepPause = false                  // set while the Mac sleeps / is waking up
     private var wakeSettleUntil = Date.distantPast  // give USB drives + Wi-Fi time to return after wake
     /// A run was cut short (sleep, pause, drive removed): sync again soon even if the interval hasn't elapsed.
@@ -1453,6 +1498,7 @@ final class SyncEngine: ObservableObject {
         if rts.isEmpty { throw hardError ?? SyncError.destinationUnavailable("No destination is reachable") }
 
         // 2. Self-heal local state.
+        inFlightLocalBytes = 0
         cleanStaging()
         for rt in rts { await rt.backend.cleanup() }
         if store.needsRebuild {
@@ -1542,36 +1588,132 @@ final class SyncEngine: ObservableObject {
         var syncedIDs: [String] = []
         refreshCounts()
 
-        // 5. Sync in chunks of 10, checkpointing after each. A local function so the same logic
-        //    serves both the main pass and the immediate iCloud-retry pass below.
+        // 5. Sync with a bounded, byte-budgeted sliding window (4 concurrent workers across Folder, SMB,
+        //    and pooled-channel SFTP, capped at 512 MB of in-flight staged data so large videos run solo),
+        //    checkpointing the ledger every 10 completed items.
         var attempted = Set<String>()
         func processAll(_ list: [String]) async throws {
-            for start in stride(from: 0, to: list.count, by: Self.chunkSize) {
-                try await ensurePhotosAccess(requestIfNeeded: false)    // revoked mid-run?
-                for rt in rts where !rt.unavailable {                   // NAS dropped / drive unplugged?
-                    if !(await rt.backend.isAvailable()) { markUnavailable(rt, "connection lost") }
-                }
-                if rts.allSatisfy(\.unavailable) { throw SyncError.destinationUnavailable("All destinations became unavailable") }
-                let ids = Array(list[start ..< min(start + Self.chunkSize, list.count)])
-                var byID: [String: PHAsset] = [:]
-                PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-                    .enumerateObjects { a, _, _ in byID[a.localIdentifier] = a }
+            guard !list.isEmpty else { return }
+            let workerLimit = SyncPipelineGate.defaultMaxWorkers
+            let pipelineGate = SyncPipelineGate(
+                maxWorkers: workerLimit,
+                maxInFlightBytes: SyncPipelineGate.defaultMaxInFlightBytes
+            )
 
-                for id in ids {
-                    try pauseCheck()
-                    defer { done += 1 }
-                    attempted.insert(id)
-                    switch try await syncOne(id: id, asset: byID[id]) {
-                    case .synced: syncedCount += 1; syncedIDs.append(id)
-                    case .failed: failedThisRun += 1
-                    case .waitingForCloud: cloudThisRun += 1
-                    case .vanished: break
+            let fetchPageSize = 64
+            var prefetched: [String: PHAsset] = [:]
+            var prefetchedUpTo = 0
+            func assetForIndex(_ idx: Int) -> PHAsset? {
+                if idx >= prefetchedUpTo {
+                    prefetched.removeAll(keepingCapacity: true)
+                    let end = min(idx + fetchPageSize, list.count)
+                    let pageIDs = Array(list[idx ..< end])
+                    PHAsset.fetchAssets(withLocalIdentifiers: pageIDs, options: nil)
+                        .enumerateObjects { a, _, _ in prefetched[a.localIdentifier] = a }
+                    prefetchedUpTo = end
+                }
+                return prefetched[list[idx]]
+            }
+
+            try await ensurePhotosAccess(requestIfNeeded: false)
+            for rt in rts where !rt.unavailable {
+                if !(await rt.backend.isAvailable()) { markUnavailable(rt, "connection lost") }
+            }
+            if rts.allSatisfy(\.unavailable) {
+                throw SyncError.destinationUnavailable("All destinations became unavailable")
+            }
+
+            var nextIndex = 0
+            var inFlightTasks = 0
+            var completedSinceCheckpoint = 0
+            var fatalError: Error?
+
+            await withTaskGroup(of: (String, Result<ItemOutcome, Error>).self) { group in
+                @MainActor func fillWindow() {
+                    while fatalError == nil, nextIndex < list.count, inFlightTasks < workerLimit {
+                        if isPaused || sleepPause || isTerminating || Task.isCancelled {
+                            fatalError = SyncError.paused
+                            break
+                        }
+                        let id = list[nextIndex]
+                        let asset = assetForIndex(nextIndex)
+                        let estBytes = asset.map(Self.estimatedBytes) ?? 50_000_000
+                        nextIndex += 1
+                        inFlightTasks += 1
+
+                        group.addTask { @MainActor in
+                            await pipelineGate.acquire(bytes: estBytes)
+                            do {
+                                try self.pauseCheck()
+                                let outcome = try await self.syncOne(id: id, asset: asset)
+                                await pipelineGate.release(bytes: estBytes)
+                                return (id, .success(outcome))
+                            } catch {
+                                await pipelineGate.release(bytes: estBytes)
+                                return (id, .failure(error))
+                            }
+                        }
                     }
                 }
-                await purgeRetiredPreviews()
-                try saveLedgerOrThrow()
-                refreshCounts()
+
+                fillWindow()
+
+                while let (finishedID, result) = await group.next() {
+                    inFlightTasks -= 1
+                    switch result {
+                    case .success(let outcome):
+                        done += 1
+                        attempted.insert(finishedID)
+                        completedSinceCheckpoint += 1
+                        switch outcome {
+                        case .synced: syncedCount += 1; syncedIDs.append(finishedID)
+                        case .failed: failedThisRun += 1
+                        case .waitingForCloud: cloudThisRun += 1
+                        case .vanished: break
+                        }
+                    case .failure(let err):
+                        if fatalError == nil {
+                            fatalError = err
+                        } else if case SyncError.paused = fatalError!, !(err is CancellationError) {
+                            if case SyncError.paused = err {} else { fatalError = err }
+                        }
+                        if isTerminating || Task.isCancelled {
+                            group.cancelAll()
+                        }
+                    }
+
+                    if fatalError == nil && completedSinceCheckpoint >= Self.chunkSize {
+                        completedSinceCheckpoint = 0
+                        await purgeRetiredPreviews()
+                        do {
+                            try saveLedgerOrThrow()
+                            refreshCounts()
+                            try await ensurePhotosAccess(requestIfNeeded: false)
+                        } catch {
+                            fatalError = error
+                        }
+                        if fatalError == nil {
+                            for rt in rts where !rt.unavailable {
+                                if !(await rt.backend.isAvailable()) { markUnavailable(rt, "connection lost") }
+                            }
+                            if rts.allSatisfy(\.unavailable) {
+                                fatalError = SyncError.destinationUnavailable("All destinations became unavailable")
+                            }
+                        }
+                    }
+
+                    fillWindow()
+                }
             }
+
+            await purgeRetiredPreviews()
+            if let fatalError {
+                store.save()
+                refreshCounts()
+                throw fatalError
+            }
+            try saveLedgerOrThrow()
+            refreshCounts()
         }
         try await processAll(scan.pending)
 
@@ -1707,12 +1849,22 @@ final class SyncEngine: ObservableObject {
     private func ensureLocalSpace(needed: Int64) throws {
         let appSupport = SandboxCompat.appSupportDirectory
         let stagingParent = stagingDir.deletingLastPathComponent()
-        let required = max(needed, 0) + Self.localReserveBytes
+        let required = inFlightLocalBytes + max(needed, 0) + Self.localReserveBytes
         for dir in [appSupport, stagingParent] {
             if let free = Self.localFreeSpace(at: dir), free < required {
                 throw SyncError.localDiskFull
             }
         }
+    }
+
+    private func reserveLocalSpace(needed: Int64) throws {
+        let clamped = max(needed, 0)
+        try ensureLocalSpace(needed: clamped)
+        inFlightLocalBytes += clamped
+    }
+
+    private func releaseLocalSpace(needed: Int64) {
+        inFlightLocalBytes = max(0, inFlightLocalBytes - max(needed, 0))
     }
 
     /// Verifies a small rolling slice (up to 3 files per local/SMB destination per run) with `F_NOCACHE`
@@ -1862,12 +2014,17 @@ final class SyncEngine: ObservableObject {
         guard try await FileHash.sha256(of: staged) == hash else {
             throw SyncError.message("\(name) in \(src.name) no longer matches its checksum (corrupted or modified)")
         }
-        let resolved = try await resolveTargetName(
+        let resolved = try await resolveAndReserveTargetName(
             name, stamp: Int(date?.timeIntervalSince1970 ?? 0),
             size: size, hash: hash, in: dst)
         if !resolved.alreadyPresent {
-            try await dst.backend.upload(local: staged, as: resolved.name, size: size, hash: hash, date: date)
-            dst.recordFile(name: resolved.name, size: size)
+            do {
+                try await dst.backend.upload(local: staged, as: resolved.name, size: size, hash: hash, date: date)
+                dst.recordFile(name: resolved.name, size: size)
+            } catch {
+                dst.releaseReservation(name: resolved.name)
+                throw error
+            }
         }
         store.addPlacement(dst.key, hash: hash, name: resolved.name, size: size)
     }
@@ -1881,7 +2038,7 @@ final class SyncEngine: ObservableObject {
     }
 
     /// Up to 3 attempts (2s, 4s backoff). Only destinations still missing the asset (or needing an edit refresh) are retried.
-    private func exportWithRetry(id: String, asset: PHAsset) async throws {
+    private func exportWithRetry(id: String, asset: PHAsset, tracker: AttemptTracker) async throws {
         var lastErr: Error = SyncError.message("Unknown error")
         for attempt in 1...3 {
             try pauseCheck()
@@ -1891,7 +2048,7 @@ final class SyncEngine: ObservableObject {
                 if store.entry(id) != nil { return }                           // finished on every reachable destination
                 throw SyncError.destinationUnavailable("All destinations became unavailable")
             }
-            do { try await export(id: id, asset: asset, targets: targets); return }
+            do { try await export(id: id, asset: asset, targets: targets, tracker: tracker); return }
             catch SyncError.paused { throw SyncError.paused }
             catch SyncError.diskFull { throw SyncError.diskFull }
             catch SyncError.localDiskFull { throw SyncError.localDiskFull }
@@ -1920,7 +2077,7 @@ final class SyncEngine: ObservableObject {
     /// Exports every media resource of the asset (original, edited render, RAW/JPEG pair,
     /// Live Photo video) to every target destination so nothing is lost if the asset is later
     /// deleted from iCloud. Each resource is downloaded and hashed ONCE, then placed on each target.
-    private func export(id: String, asset: PHAsset, targets: [DestRuntime]) async throws {
+    private func export(id: String, asset: PHAsset, targets: [DestRuntime], tracker: AttemptTracker) async throws {
         let plan = Self.exportPlan(PHAssetResource.assetResources(for: asset))
         guard let primary = plan.first else { throw SyncError.message("No exportable resource") }
         // Never treat an edited render as the original: the original resource must exist.
@@ -1950,16 +2107,26 @@ final class SyncEngine: ObservableObject {
             return
         }
 
-        try ensureLocalSpace(needed: Self.estimatedBytes(asset))
+        let estimated = Self.estimatedBytes(asset)
+        try reserveLocalSpace(needed: estimated)
+        defer { releaseLocalSpace(needed: estimated) }
 
         // Destinations that can't hold this asset are skipped for it (and reported), not run-fatal.
         var failed: [(DestRuntime, Error)] = []
         var remaining: [DestRuntime] = []
+        var reservedSpaceOn: [DestRuntime] = []
+        var writtenBytesByDest: [String: Int64] = [:]
+        defer {
+            for rt in reservedSpaceOn {
+                rt.settleSpace(reservedBytes: estimated, writtenBytes: writtenBytesByDest[rt.key] ?? 0)
+            }
+        }
         for rt in targets {
-            if let free = await rt.backend.freeSpace(), free < Self.estimatedBytes(asset) + 200_000_000 {
-                failed.append((rt, SyncError.diskFull))
-            } else {
+            if await rt.reserveSpace(estimatedBytes: estimated) {
                 remaining.append(rt)
+                reservedSpaceOn.append(rt)
+            } else {
+                failed.append((rt, SyncError.diskFull))
             }
         }
         if remaining.isEmpty { throw SyncError.diskFull }
@@ -1986,17 +2153,53 @@ final class SyncEngine: ObservableObject {
             let staged = try await stageResource(res, asset: asset, isPrimary: i == 0, hasEdits: hasEdits, exportFolder: exportFolder)
             defer { try? FileManager.default.removeItem(at: staged.url) }
             parts.append(Part(hash: staged.hash, type: res.type.rawValue, size: staged.size))
-            for rt in remaining where !rt.unavailable {
-                do {
-                    try await place(staged, res: res, asset: asset, primaryBase: base, isPrimary: i == 0, on: rt)
-                } catch {
-                    if !(await rt.backend.isAvailable()) {
-                        markUnavailable(rt, "connection lost during copy")
-                    } else {
-                        failed.append((rt, error))
-                        log.error("\(rt.name): \(res.originalFilename) failed: \(ErrorInfo.describe(error))")
+
+            let liveTargets = remaining.filter { !$0.unavailable }
+            if liveTargets.count <= 1 {
+                for rt in liveTargets {
+                    do {
+                        let uploaded = try await place(
+                            staged, res: res, asset: asset, primaryBase: base,
+                            isPrimary: i == 0, tracker: tracker, on: rt)
+                        if uploaded { writtenBytesByDest[rt.key, default: 0] += Int64(staged.size) }
+                    } catch {
+                        if !(await rt.backend.isAvailable()) {
+                            markUnavailable(rt, "connection lost during copy")
+                        } else {
+                            failed.append((rt, error))
+                            log.error("\(rt.name): \(res.originalFilename) failed: \(ErrorInfo.describe(error))")
+                        }
+                        remaining.removeAll { $0 === rt }
                     }
-                    remaining.removeAll { $0 === rt }
+                }
+            } else {
+                await withTaskGroup(of: (DestRuntime, Result<Bool, Error>).self) { destGroup in
+                    for rt in liveTargets {
+                        destGroup.addTask { @MainActor in
+                            do {
+                                let uploaded = try await self.place(
+                                    staged, res: res, asset: asset, primaryBase: base,
+                                    isPrimary: i == 0, tracker: tracker, on: rt)
+                                return (rt, .success(uploaded))
+                            } catch {
+                                return (rt, .failure(error))
+                            }
+                        }
+                    }
+                    while let (rt, resOutcome) = await destGroup.next() {
+                        switch resOutcome {
+                        case .success(let uploaded):
+                            if uploaded { writtenBytesByDest[rt.key, default: 0] += Int64(staged.size) }
+                        case .failure(let error):
+                            if !(await rt.backend.isAvailable()) {
+                                markUnavailable(rt, "connection lost during copy")
+                            } else {
+                                failed.append((rt, error))
+                                log.error("\(rt.name): \(res.originalFilename) failed: \(ErrorInfo.describe(error))")
+                            }
+                            remaining.removeAll { $0 === rt }
+                        }
+                    }
                 }
             }
         }
@@ -2069,54 +2272,86 @@ final class SyncEngine: ObservableObject {
                 throw SyncError.cloudOnly("\(details) | Photos app: \(error.localizedDescription)")
             }
         }
-        guard let size = FileHash.size(of: staged), size > 0 else {
-            throw SyncError.message("Downloaded file is empty")
+        let isImage = res.contentType.conforms(to: .image) || (isPrimary && asset.mediaType == .image)
+        let isVideo = !isImage && (res.contentType.conforms(to: .audiovisualContent) || (isPrimary && asset.mediaType == .video))
+        let declaredUTI = res.uniformTypeIdentifier
+        let expectedW = asset.pixelWidth
+        let expectedH = asset.pixelHeight
+
+        if isImage {
+            try await Task.detached {
+                guard let sz = FileHash.size(of: staged), sz > 0 else {
+                    throw SyncError.message("Downloaded file is empty")
+                }
+                try Self.verifyImage(
+                    staged, declaredUTI: declaredUTI,
+                    expectedWidth: expectedW, expectedHeight: expectedH,
+                    isPrimary: isPrimary, hasEdits: hasEdits)
+            }.value
+        } else {
+            guard let sz = FileHash.size(of: staged), sz > 0 else {
+                throw SyncError.message("Downloaded file is empty")
+            }
+            if isVideo {
+                try await Self.verifyVideo(staged, asset: asset, isPrimary: isPrimary, hasEdits: hasEdits)
+            }
         }
-        if res.contentType.conforms(to: .image) || (isPrimary && asset.mediaType == .image) {
-            try Self.verifyImage(staged, resource: res, asset: asset, isPrimary: isPrimary, hasEdits: hasEdits)
-        } else if res.contentType.conforms(to: .audiovisualContent) || (isPrimary && asset.mediaType == .video) {
-            try await Self.verifyVideo(staged, asset: asset, isPrimary: isPrimary, hasEdits: hasEdits)
-        }
-        let hash = try await FileHash.sha256(of: staged)          // checksum of the true original
+        let (hash, size) = try await FileHash.sha256AndSize(of: staged)   // checksum + exact byte size of the true original
+        guard size > 0 else { throw SyncError.message("Downloaded file is empty") }
         success = true
         return StagedFile(url: staged, size: size, hash: hash)
     }
 
-    /// Put one staged file on one destination: dedupe by content, else a verified upload.
+    /// Put one staged file on one destination: dedupe by content (including against concurrent workers),
+    /// else atomically reserve a collision-free filename and perform a verified upload.
+    /// Returns `true` when new bytes were written to `rt`.
     private func place(_ staged: StagedFile, res: PHAssetResource, asset: PHAsset, primaryBase: String,
-                       isPrimary: Bool, on rt: DestRuntime) async throws {
+                       isPrimary: Bool, tracker: AttemptTracker, on rt: DestRuntime) async throws -> Bool {
         let marker = "\(rt.key):\(staged.hash)"
+        _ = await rt.hashGate.waitIfInFlight(key: staged.hash)
         if let existing = store.placement(rt.key, hash: staged.hash),
            rt.names.contains(FileNames.key(existing)),
            rt.sizes[FileNames.key(existing)].map({ $0 == staged.size }) ?? true {
-            if !attemptHashes.contains(marker) {      // a file we just wrote for this asset isn't a duplicate
+            if !tracker.markers.contains(marker) {      // a file we just wrote for this asset isn't a duplicate
                 recordDuplicate("Duplicate skipped at \(rt.name): \(res.originalFilename) is identical to \(existing)")
             }
-            return
+            return false
         }
+        rt.hashGate.begin(key: staged.hash)
+        defer { rt.hashGate.end(key: staged.hash) }
+
         let preferred = Self.targetName(res, primaryBase: primaryBase, isPrimary: isPrimary)
-        let resolved = try await resolveTargetName(
+        let resolved = try await resolveAndReserveTargetName(
             preferred, stamp: Int(asset.creationDate?.timeIntervalSince1970 ?? 0),
             size: staged.size, hash: staged.hash, in: rt)
+        var wroteBytes = false
         if !resolved.alreadyPresent {
-            try await rt.backend.upload(local: staged.url, as: resolved.name, size: staged.size, hash: staged.hash, date: asset.creationDate)
-            rt.recordFile(name: resolved.name, size: staged.size)
+            do {
+                try await rt.backend.upload(local: staged.url, as: resolved.name, size: staged.size, hash: staged.hash, date: asset.creationDate)
+                rt.recordFile(name: resolved.name, size: staged.size)
+                wroteBytes = true
+            } catch {
+                rt.releaseReservation(name: resolved.name)
+                throw error
+            }
         } else {
             log.info("Adopted existing verified file \(resolved.name) at \(rt.name)")
         }
         store.addPlacement(rt.key, hash: staged.hash, name: resolved.name, size: staged.size)
-        attemptHashes.insert(marker)
+        tracker.markers.insert(marker)
+        return wroteBytes
     }
 
     /// Proves a staged image decodes, matches its declared format, and (when it is the primary
     /// resource of an unedited asset) matches the library's full pixel dimensions.
-    nonisolated private static func verifyImage(_ url: URL, resource: PHAssetResource,
-                                                asset: PHAsset, isPrimary: Bool, hasEdits: Bool) throws {
+    nonisolated private static func verifyImage(_ url: URL, declaredUTI: String,
+                                                expectedWidth: Int, expectedHeight: Int,
+                                                isPrimary: Bool, hasEdits: Bool) throws {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), CGImageSourceGetCount(src) > 0 else {
             throw SyncError.message("Exported image cannot be decoded (corrupt or incomplete)")
         }
         if let actual = CGImageSourceGetType(src).flatMap({ UTType($0 as String) }),
-           let declared = UTType(resource.uniformTypeIdentifier),
+           let declared = UTType(declaredUTI),
            !actual.conforms(to: declared) && !declared.conforms(to: actual) {
             throw SyncError.message("Exported format \(actual.identifier) differs from declared \(declared.identifier)")
         }
@@ -2124,11 +2359,11 @@ final class SyncEngine: ObservableObject {
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = props[kCGImagePropertyPixelWidth] as? Int,
               let h = props[kCGImagePropertyPixelHeight] as? Int,
-              asset.pixelWidth > 0, asset.pixelHeight > 0 else { return }
+              expectedWidth > 0, expectedHeight > 0 else { return }
         // Orientation may swap width/height, so compare as an unordered pair.
-        let same = (w == asset.pixelWidth && h == asset.pixelHeight) || (w == asset.pixelHeight && h == asset.pixelWidth)
+        let same = (w == expectedWidth && h == expectedHeight) || (w == expectedHeight && h == expectedWidth)
         if !same {
-            throw SyncError.message("Exported image is \(w)×\(h) but the original is \(asset.pixelWidth)×\(asset.pixelHeight) – not full resolution")
+            throw SyncError.message("Exported image is \(w)×\(h) but the original is \(expectedWidth)×\(expectedHeight) – not full resolution")
         }
     }
 
@@ -2168,32 +2403,41 @@ final class SyncEngine: ObservableObject {
         return clean
     }
 
-    /// Picks a destination filename that doesn't collide (case-insensitively) with unrelated files, while
-    /// adopting an already-present byte-identical file (e.g. from an earlier run interrupted before the
-    /// ledger was saved) instead of duplicating it under a `_<stamp>` suffix.
-    private func resolveTargetName(_ name: String, stamp: Int, size: UInt64, hash: String,
-                                   in rt: DestRuntime) async throws -> (name: String, alreadyPresent: Bool) {
-        func matchesExisting(_ candidate: String) async throws -> String? {
-            let k = FileNames.key(candidate)
-            guard rt.names.contains(k) else { return nil }
-            let actual = rt.actualNames[k] ?? candidate
-            guard rt.sizes[k] == size else { return "" }            // occupied by a different file
+    /// Picks and atomically reserves a destination filename that doesn't collide (case-insensitively) with
+    /// committed or in-flight files, while adopting an already-present byte-identical file (e.g. from an
+    /// earlier run interrupted before the ledger was saved) instead of duplicating it under a `_<stamp>` suffix.
+    /// When `alreadyPresent == false`, the returned `name` is reserved in `rt.nameBook` and MUST be committed
+    /// via `rt.recordFile` or released via `rt.releaseReservation`.
+    private func resolveAndReserveTargetName(_ name: String, stamp: Int, size: UInt64, hash: String,
+                                             in rt: DestRuntime) async throws -> (name: String, alreadyPresent: Bool) {
+        func tryClaimOrAdopt(_ candidate: String) async throws -> (name: String, alreadyPresent: Bool)? {
+            if rt.nameBook.reserve(candidate) {
+                return (candidate, false)
+            }
+            guard let existing = rt.nameBook.unreservedExisting(candidate) else {
+                return nil
+            }
+            guard existing.size == size else {
+                return nil
+            }
+            guard rt.nameBook.lockExistingForInspection(candidate) else {
+                return nil
+            }
+            defer { rt.nameBook.releaseReservation(candidate) }
             do {
-                if try await rt.backend.hash(of: actual, noCache: true) == hash {
-                    return actual
+                if try await rt.backend.hash(of: existing.actualName, noCache: true) == hash {
+                    return (existing.actualName, true)
                 }
             } catch SyncError.destinationUnavailable(let m) {
                 throw SyncError.destinationUnavailable(m)
             } catch {
                 // Unreadable foreign file under that name: treat as occupied and pick a unique suffix.
             }
-            return ""
+            return nil
         }
 
-        if let hit = try await matchesExisting(name) {
-            if !hit.isEmpty { return (hit, true) }
-        } else {
-            return (name, false)
+        if let claimed = try await tryClaimOrAdopt(name) {
+            return claimed
         }
 
         let base = (name as NSString).deletingPathExtension
@@ -2204,12 +2448,13 @@ final class SyncEngine: ObservableObject {
         }
         var result = candidate("")
         var n = 1
-        while let hit = try await matchesExisting(result) {
-            if !hit.isEmpty { return (hit, true) }
+        while true {
+            if let claimed = try await tryClaimOrAdopt(result) {
+                return claimed
+            }
             result = candidate("_\(n)")
             n += 1
         }
-        return (result, false)
     }
 
     // MARK: Previews (best local version while the original is unavailable)
@@ -2247,13 +2492,25 @@ final class SyncEngine: ObservableObject {
             }
             let preferred = FileNames.sanitize("\(base)-preview.\(preview.ext)")
             do {
-                let resolved = try await resolveTargetName(
+                _ = await rt.hashGate.waitIfInFlight(key: hash)
+                if let existing = store.placement(rt.key, hash: hash), rt.names.contains(FileNames.key(existing)) {
+                    saved = true; continue
+                }
+                rt.hashGate.begin(key: hash)
+                defer { rt.hashGate.end(key: hash) }
+
+                let resolved = try await resolveAndReserveTargetName(
                     preferred, stamp: Int(asset.creationDate?.timeIntervalSince1970 ?? 0),
                     size: size, hash: hash, in: rt)
                 if !resolved.alreadyPresent {
-                    try await rt.backend.upload(local: staged, as: resolved.name, size: size, hash: hash, date: asset.creationDate)
-                    rt.recordFile(name: resolved.name, size: size)
-                    uploadedNew = true
+                    do {
+                        try await rt.backend.upload(local: staged, as: resolved.name, size: size, hash: hash, date: asset.creationDate)
+                        rt.recordFile(name: resolved.name, size: size)
+                        uploadedNew = true
+                    } catch {
+                        rt.releaseReservation(name: resolved.name)
+                        throw error
+                    }
                 }
                 store.addPlacement(rt.key, hash: hash, name: resolved.name, size: size)
                 saved = true
@@ -2309,9 +2566,9 @@ final class SyncEngine: ObservableObject {
     private func syncOne(id: String, asset: PHAsset?) async throws -> ItemOutcome {
         guard let asset else { return .vanished }                   // vanished from the library
         let wasTracked = store.isFailing(id)
+        let tracker = AttemptTracker()
         do {
-            attemptHashes.removeAll()
-            try await exportWithRetry(id: id, asset: asset)
+            try await exportWithRetry(id: id, asset: asset, tracker: tracker)
             if wasTracked && !store.isFailing(id) { refreshCounts() }   // live decrease
             return .synced
         } catch SyncError.diskFull {
