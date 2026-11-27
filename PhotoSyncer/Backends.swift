@@ -72,7 +72,7 @@ nonisolated final class FolderBackend: DestinationBackend, @unchecked Sendable {
 
     func list() async throws -> [RemoteFile] {
         let target = url
-        return try await BlockingIO.run(timeout: 60, timeoutMessage: "Listing the destination folder timed out") {
+        return try await BlockingIO.run(timeout: 300, timeoutMessage: "Listing the destination folder timed out") {
             let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
             let urls: [URL]
             do {
@@ -390,5 +390,147 @@ nonisolated func withTimeout<T: Sendable>(_ seconds: TimeInterval,
                 cont.resume(throwing: SyncError.destinationUnavailable(timeoutMessage))
             }
         }
+    }
+}
+
+// MARK: - SFTP Endpoint & Path Helpers
+
+/// Parses flexible SFTP server inputs ("nas.local", "192.168.1.20:2222", "alice@nas.local:/volume1/Photos",
+/// "alice@nas.local:~/Photos", or "sftp://alice@nas.local:2222/Photos") for the SFTP Connect-to-Server wizard.
+nonisolated struct SFTPServerEndpoint: Equatable, Sendable {
+    var host: String
+    var port: Int
+    var usernameHint: String?
+    var pathHint: String?
+
+    static func parse(_ rawInput: String, defaultPort: Int = Destination.defaultSFTPPort) -> SFTPServerEndpoint? {
+        var text = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let fallbackPort = (1...65_535).contains(defaultPort) ? defaultPort : Destination.defaultSFTPPort
+        var scpPathHint: String?
+
+        if let schemeRange = text.range(of: "://") {
+            let scheme = text[..<schemeRange.lowerBound].lowercased()
+            guard scheme == "sftp" || scheme == "ssh" else { return nil }
+        } else {
+            // Handle SCP-style `user@host:/remote/path` or `host:~/photos` without confusing `host:2222` or IPv6 `[::1]:2222`.
+            let searchStart: String.Index
+            if let closeBracket = text.firstIndex(of: "]") {
+                searchStart = text.index(after: closeBracket)
+            } else {
+                searchStart = text.startIndex
+            }
+            if searchStart < text.endIndex,
+               let colon = text[searchStart...].firstIndex(of: ":") {
+                let afterColon = String(text[text.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+                let isNumericPort = !afterColon.isEmpty && afterColon.allSatisfy(\.isNumber)
+                if !isNumericPort {
+                    if !afterColon.isEmpty {
+                        scpPathHint = afterColon
+                    }
+                    text = String(text[..<colon])
+                }
+            }
+            text = "sftp://" + text
+        }
+
+        guard let comps = URLComponents(string: text),
+              let rawHost = comps.host?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawHost.isEmpty else {
+            return nil
+        }
+
+        if let p = comps.port, !(1...65_535).contains(p) {
+            return nil
+        }
+        let resolvedPort = comps.port ?? fallbackPort
+        let userHint = (comps.user?.isEmpty == false) ? comps.user : nil
+        let urlPath = comps.path.trimmingCharacters(in: .whitespaces)
+        let resolvedPathHint: String?
+        if let scpPathHint {
+            resolvedPathHint = scpPathHint
+        } else if !urlPath.isEmpty {
+            resolvedPathHint = urlPath
+        } else {
+            resolvedPathHint = nil
+        }
+
+        return SFTPServerEndpoint(
+            host: rawHost,
+            port: resolvedPort,
+            usernameHint: userHint,
+            pathHint: resolvedPathHint
+        )
+    }
+}
+
+/// Pure POSIX-style SFTP path manipulation (SFTP wire paths always use forward slashes `/`).
+nonisolated enum SFTPPath {
+    static func normalize(_ raw: String) -> String {
+        let unified = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        var stack: [String] = []
+        for part in unified.split(separator: "/", omittingEmptySubsequences: true) {
+            if part == "." { continue }
+            if part == ".." {
+                if !stack.isEmpty { stack.removeLast() }
+            } else {
+                stack.append(String(part))
+            }
+        }
+        return stack.isEmpty ? "/" : "/" + stack.joined(separator: "/")
+    }
+
+    static func join(_ base: String, _ child: String) -> String {
+        let trimmedChild = child.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        if trimmedChild.hasPrefix("/") {
+            return normalize(trimmedChild)
+        }
+        let cleanBase = normalize(base)
+        if cleanBase == "/" {
+            return normalize("/" + trimmedChild)
+        }
+        return normalize(cleanBase + "/" + trimmedChild)
+    }
+
+    static func resolve(_ input: String, relativeTo currentPath: String, homePath: String) -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        if trimmed.isEmpty || trimmed == "." {
+            return normalize(currentPath)
+        }
+        if trimmed == "~" {
+            return normalize(homePath)
+        }
+        if trimmed.hasPrefix("~/") {
+            return join(homePath, String(trimmed.dropFirst(2)))
+        }
+        if trimmed.hasPrefix("/") {
+            return normalize(trimmed)
+        }
+        return join(currentPath, trimmed)
+    }
+
+    static func parent(of path: String) -> String? {
+        let norm = normalize(path)
+        guard norm != "/" else { return nil }
+        guard let slash = norm.lastIndex(of: "/") else { return nil }
+        if slash == norm.startIndex { return "/" }
+        return String(norm[..<slash])
+    }
+
+    static func breadcrumbs(for path: String) -> [(label: String, fullPath: String)] {
+        let norm = normalize(path)
+        var crumbs: [(label: String, fullPath: String)] = [("/", "/")]
+        guard norm != "/" else { return crumbs }
+        var running = ""
+        for comp in norm.split(separator: "/") {
+            let name = String(comp)
+            running += "/" + name
+            crumbs.append((name, running))
+        }
+        return crumbs
     }
 }

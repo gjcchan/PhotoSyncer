@@ -5,6 +5,7 @@ import Security
 nonisolated struct Destination: Codable, Identifiable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable { case folder, sftp, smb }
 
+    static let defaultSFTPPort = 22
     static let defaultSMBPort = 445
 
     var id = UUID()

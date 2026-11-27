@@ -75,6 +75,7 @@ private struct SettingsWindowConfigurator: NSViewRepresentable {
         private var observations: [NSKeyValueObservation] = []
         private var lastTab: Int?
         private var isEnforcing = false
+        private var enforceScheduled = false
 
         func attach(to window: NSWindow?, selectedTab: Int?) {
             guard let window else { return }
@@ -85,26 +86,47 @@ private struct SettingsWindowConfigurator: NSViewRepresentable {
             if isNewWindow {
                 observedWindow = window
                 observations = [
-                    window.observe(\.styleMask, options: [.new]) { [weak self] _, _ in
-                        if Thread.isMainThread {
-                            MainActor.assumeIsolated { self?.enforce() }
+                    window.observe(\.styleMask, options: [.new]) { [weak self] win, _ in
+                        guard Thread.isMainThread else { return }
+                        MainActor.assumeIsolated {
+                            if !win.styleMask.contains(.resizable) || !win.styleMask.contains(.miniaturizable) {
+                                self?.scheduleEnforce()
+                            }
                         }
                     },
-                    window.observe(\.maxSize, options: [.new]) { [weak self] _, _ in
-                        if Thread.isMainThread {
-                            MainActor.assumeIsolated { self?.enforce() }
+                    window.observe(\.maxSize, options: [.new]) { [weak self] win, _ in
+                        guard Thread.isMainThread else { return }
+                        MainActor.assumeIsolated {
+                            if win.maxSize.width < 10_000 || win.maxSize.height < 10_000 {
+                                self?.scheduleEnforce()
+                            }
                         }
                     },
-                    window.observe(\.contentMaxSize, options: [.new]) { [weak self] _, _ in
-                        if Thread.isMainThread {
-                            MainActor.assumeIsolated { self?.enforce() }
+                    window.observe(\.contentMaxSize, options: [.new]) { [weak self] win, _ in
+                        guard Thread.isMainThread else { return }
+                        MainActor.assumeIsolated {
+                            if win.contentMaxSize.width < 10_000 || win.contentMaxSize.height < 10_000 {
+                                self?.scheduleEnforce()
+                            }
                         }
                     },
                 ]
             }
 
             if isNewWindow || tabChanged {
-                enforce()
+                scheduleEnforce()
+            }
+        }
+
+        /// Defers `NSWindow` styleMask/min/max mutations out of `NSHostingView.layout()` so AppKit
+        /// never calls `-layoutSubtreeIfNeeded` on a hosting view that is already being laid out.
+        private func scheduleEnforce() {
+            guard !enforceScheduled else { return }
+            enforceScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.enforceScheduled = false
+                self.enforce()
             }
         }
 

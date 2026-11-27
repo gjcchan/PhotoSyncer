@@ -349,9 +349,8 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     // MARK: Settings window
     func showSettings() {
         EnvironmentValues().openSettings()
-        bringSettingsToFront()
-        // Re-assert on the next run-loop turn after NSMenu finishes closing its tracking session
-        // and SwiftUI finishes creating the window on first open.
+        // Defer window style/size/activation adjustments to the next run-loop turn after NSMenu
+        // closes its tracking session and SwiftUI finishes initial layout of the Settings window.
         DispatchQueue.main.async { [weak self] in
             self?.bringSettingsToFront()
         }

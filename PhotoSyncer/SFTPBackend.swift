@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import CryptoKit
 import Citadel
 import NIOCore
@@ -163,7 +164,7 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
         setSession(ssh: client, pool: AsyncResourcePool(channels))
     }
 
-    private static func map(_ error: Error, pinned: Bool) -> Error {
+    fileprivate static func map(_ error: Error, pinned: Bool) -> Error {
         if error is SyncError { return error }
         if let status = error as? SFTPMessage.Status {
             let detail = status.message.isEmpty ? String(describing: status.errorCode) : status.message
@@ -528,5 +529,515 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
         if let sshClient {
             _ = try? await withTimeout(5, timeoutMessage: "SSH close timed out") { try await sshClient.close() }
         }
+    }
+}
+
+// MARK: - Interactive SFTP Wizard Browse Session
+
+struct SFTPLocationShortcut: Identifiable, Hashable, Sendable {
+    var id: String { path }
+    var title: String
+    var path: String
+    var systemImage: String
+}
+
+/// Drives the Connect-to-Server style SFTP wizard: authenticates over SSH (capturing the server's
+/// OpenSSH host key for TOFU pinning), resolves the user's home directory via `SSH_FXP_REALPATH`,
+/// validates folders in single-packet `SSH_FXP_STAT` checks (~15ms without listing 30,000+ files),
+/// and browses or creates remote folders over the live encrypted SFTP session.
+@MainActor
+final class SFTPBrowseSession: ObservableObject {
+    @Published private(set) var connectedHost = ""
+    @Published private(set) var connectedPort = Destination.defaultSFTPPort
+    @Published private(set) var connectedUsername = ""
+    private var connectedPassword = ""
+    @Published private(set) var connectedHostKey = ""
+    @Published private(set) var hostKeyFingerprint = ""
+
+    @Published private(set) var homePath = "/"
+    @Published private(set) var customLocations: [String] = []
+    @Published private(set) var currentPath = "/"
+    @Published private(set) var subfolders: [String] = []
+    @Published private(set) var hasHiddenSubfolders = false
+    @Published var showHiddenFolders = false {
+        didSet {
+            if showHiddenFolders != oldValue && hasScannedCurrentFolder {
+                applySubfolderFilter()
+            }
+        }
+    }
+
+    @Published private(set) var isWritable = true
+    @Published private(set) var isReady = false
+    @Published private(set) var hasScannedCurrentFolder = false
+    @Published private(set) var isConnecting = false
+    @Published private(set) var isLoadingFolder = false
+    @Published private(set) var isScanningSubfolders = false
+    @Published var errorMessage: String?
+
+    private var allDiscoveredSubfolders: [String] = []
+    private var sshClient: SSHClient?
+    private var controlSFTP: SFTPClient?
+    private var activeScanChannel: SFTPClient?
+    private var userCancelledConnect = false
+    private var connectTask: Task<Bool, Never>?
+    private var navTask: Task<Bool, Never>?
+    private var scanTask: Task<Void, Never>?
+
+    var sidebarLocations: [SFTPLocationShortcut] {
+        var items: [SFTPLocationShortcut] = [
+            SFTPLocationShortcut(title: "Home", path: homePath, systemImage: "house")
+        ]
+        if homePath != "/" {
+            items.append(SFTPLocationShortcut(title: "Server Root (/)", path: "/", systemImage: "internaldrive"))
+        }
+        for custom in customLocations where custom != homePath && custom != "/" {
+            let label = URL(fileURLWithPath: custom).lastPathComponent
+            items.append(SFTPLocationShortcut(
+                title: label.isEmpty ? custom : label,
+                path: custom,
+                systemImage: "folder"
+            ))
+        }
+        return items
+    }
+
+    var breadcrumbs: [(label: String, fullPath: String)] {
+        SFTPPath.breadcrumbs(for: currentPath)
+    }
+
+    var parentPath: String? {
+        SFTPPath.parent(of: currentPath)
+    }
+
+    var currentFolderDisplayName: String {
+        if currentPath == "/" { return "/" }
+        let last = URL(fileURLWithPath: currentPath).lastPathComponent
+        return last.isEmpty ? currentPath : last
+    }
+
+    var defaultDestinationName: String {
+        if currentPath == "/" { return connectedHost }
+        return "\(connectedHost)/\(currentFolderDisplayName)"
+    }
+
+    var targetPreviewURLString: String {
+        let portPart = connectedPort == Destination.defaultSFTPPort ? "" : ":\(connectedPort)"
+        return "sftp://\(connectedUsername)@\(connectedHost)\(portPart)\(currentPath)"
+    }
+
+    func cancelConnect() {
+        userCancelledConnect = true
+        connectTask?.cancel()
+        connectTask = nil
+        isConnecting = false
+    }
+
+    func connect(serverInput: String,
+                 port: Int,
+                 username: String,
+                 password: String) async -> Bool {
+        guard !isConnecting else { return false }
+        guard let endpoint = SFTPServerEndpoint.parse(serverInput, defaultPort: port) else {
+            errorMessage = "Enter a valid server hostname or IP address (for example, nas.local or 192.168.1.20)."
+            return false
+        }
+        let resolvedUser = username.trimmingCharacters(in: .whitespaces).isEmpty
+            ? (endpoint.usernameHint ?? "")
+            : username.trimmingCharacters(in: .whitespaces)
+        if resolvedUser.isEmpty {
+            errorMessage = "Enter your SSH username for \(endpoint.host)."
+            return false
+        }
+        if password.isEmpty {
+            errorMessage = "Enter your SSH password for \(endpoint.host)."
+            return false
+        }
+
+        userCancelledConnect = false
+        errorMessage = nil
+        isConnecting = true
+
+        let task = Task<Bool, Never> { @MainActor in
+            await self.closeConnection()
+            let tofu = TOFUValidator()
+            var settings = SSHClientSettings(
+                host: endpoint.host,
+                port: endpoint.port,
+                authenticationMethod: { .passwordBased(username: resolvedUser, password: password) },
+                hostKeyValidator: .custom(tofu)
+            )
+            settings.connectTimeout = .seconds(20)
+
+            do {
+                let ssh = try await SSHClient.connect(to: settings)
+                if Task.isCancelled {
+                    try? await ssh.close()
+                    throw CancellationError()
+                }
+                let sftp: SFTPClient
+                do {
+                    sftp = try await withTimeout(25) { try await ssh.openSFTP() }
+                } catch {
+                    try? await ssh.close()
+                    throw error
+                }
+
+                let rawHome = (try? await withTimeout(15) { try await sftp.getRealPath(atPath: ".") }) ?? "/"
+                let normalizedHome = SFTPPath.normalize(rawHome)
+                let capturedKey = tofu.captured ?? ""
+
+                self.sshClient = ssh
+                self.controlSFTP = sftp
+                self.connectedHost = endpoint.host
+                self.connectedPort = endpoint.port
+                self.connectedUsername = resolvedUser
+                self.connectedPassword = password
+                self.connectedHostKey = capturedKey
+                self.hostKeyFingerprint = capturedKey.isEmpty ? "Unknown" : HostKey.fingerprint(capturedKey)
+                self.homePath = normalizedHome
+                self.customLocations = []
+                self.currentPath = normalizedHome
+                self.allDiscoveredSubfolders = []
+                self.subfolders = []
+                self.hasHiddenSubfolders = false
+                self.hasScannedCurrentFolder = false
+                self.isReady = false
+                self.isConnecting = false
+
+                let initialTarget: String
+                if let hint = endpoint.pathHint {
+                    initialTarget = SFTPPath.resolve(hint, relativeTo: normalizedHome, homePath: normalizedHome)
+                } else {
+                    initialTarget = normalizedHome
+                }
+
+                Task { @MainActor in
+                    let ok = await self.selectPath(initialTarget, scanSubfolders: false, fallbackToHome: initialTarget != normalizedHome)
+                    if ok && initialTarget != normalizedHome && initialTarget != "/" {
+                        self.pinCustomLocation(self.currentPath)
+                    }
+                }
+                return true
+            } catch is CancellationError {
+                self.isConnecting = false
+                if !self.userCancelledConnect {
+                    self.errorMessage = "Connection to \(endpoint.host) was interrupted. Click Connect to try again."
+                }
+                return false
+            } catch {
+                self.isConnecting = false
+                let mapped = SFTPBackend.map(error, pinned: false)
+                let msg = mapped.localizedDescription.isEmpty
+                    ? "Could not connect to \(endpoint.host)."
+                    : mapped.localizedDescription
+                self.errorMessage = msg
+                EventLog.shared.error("SFTP wizard connect to \(endpoint.host) failed: \(msg)")
+                return false
+            }
+        }
+        connectTask = task
+        let ok = await task.value
+        connectTask = nil
+        return ok
+    }
+
+    private func pinCustomLocation(_ path: String) {
+        let norm = SFTPPath.normalize(path)
+        guard norm != homePath, norm != "/", !customLocations.contains(norm) else { return }
+        customLocations.append(norm)
+    }
+
+    private func cancelSubfolderScan() {
+        scanTask?.cancel()
+        scanTask = nil
+        isScanningSubfolders = false
+        if let ch = activeScanChannel {
+            activeScanChannel = nil
+            Task.detached(priority: .utility) {
+                try? await withTimeout(3) { try await ch.close() }
+            }
+        }
+    }
+
+    @discardableResult
+    func selectPath(_ rawTarget: String,
+                    scanSubfolders: Bool = false,
+                    recordLocation: Bool = false,
+                    fallbackToHome: Bool = false) async -> Bool {
+        navTask?.cancel()
+        cancelSubfolderScan()
+
+        guard let sftp = controlSFTP, sftp.isActive else {
+            errorMessage = "The SFTP connection was closed. Click Back and reconnect."
+            isReady = false
+            isLoadingFolder = false
+            return false
+        }
+
+        let resolvedTarget = SFTPPath.resolve(rawTarget, relativeTo: currentPath, homePath: homePath)
+        errorMessage = nil
+        isLoadingFolder = true
+
+        let home = homePath
+        let task = Task<Bool, Never> { @MainActor in
+            do {
+                let verified = try await Self.verifyRemoteDirectory(using: sftp, path: resolvedTarget)
+                guard !Task.isCancelled else { return false }
+                self.currentPath = verified.canonicalPath
+                self.allDiscoveredSubfolders = []
+                self.subfolders = []
+                self.hasHiddenSubfolders = false
+                self.hasScannedCurrentFolder = false
+                self.isWritable = verified.writable
+                self.isReady = true
+                self.isLoadingFolder = false
+                if recordLocation {
+                    self.pinCustomLocation(verified.canonicalPath)
+                }
+                if !verified.writable {
+                    self.errorMessage = "“\(verified.canonicalPath)” has read-only permissions on the server. Open or create a writable folder."
+                }
+                if scanSubfolders {
+                    self.loadSubfolders()
+                }
+                return true
+            } catch {
+                guard !Task.isCancelled else { return false }
+                if fallbackToHome && resolvedTarget != home {
+                    if let homeCheck = try? await Self.verifyRemoteDirectory(using: sftp, path: home), !Task.isCancelled {
+                        self.currentPath = homeCheck.canonicalPath
+                        self.allDiscoveredSubfolders = []
+                        self.subfolders = []
+                        self.hasHiddenSubfolders = false
+                        self.hasScannedCurrentFolder = false
+                        self.isWritable = homeCheck.writable
+                        self.isReady = true
+                        self.isLoadingFolder = false
+                        self.errorMessage = "Folder “\(resolvedTarget)” wasn't found; opened your home folder instead."
+                        return true
+                    }
+                }
+                self.isLoadingFolder = false
+                let mapped = SFTPBackend.map(error, pinned: false)
+                self.errorMessage = mapped.localizedDescription
+                return false
+            }
+        }
+        navTask = task
+        return await task.value
+    }
+
+    nonisolated private static func verifyRemoteDirectory(
+        using sftp: SFTPClient,
+        path: String
+    ) async throws -> (canonicalPath: String, writable: Bool) {
+        let canonicalRaw = try await withTimeout(15, timeoutMessage: "Checking the SFTP folder timed out") {
+            try await sftp.getRealPath(atPath: path)
+        }
+        let canonical = SFTPPath.normalize(canonicalRaw)
+        let attrs = try await withTimeout(15, timeoutMessage: "Checking the SFTP folder timed out") {
+            try await sftp.getAttributes(at: canonical)
+        }
+        if let perms = attrs.permissions {
+            let ftype = perms & 0o170000
+            if ftype != 0 && ftype != 0o040000 {
+                throw SyncError.message("“\(canonical)” is a file, not a folder.")
+            }
+            // Flag as read-only only when POSIX mode explicitly clears every write bit (`chmod a-w`, e.g. 0o555).
+            if ftype == 0o040000 && (perms & 0o222) == 0 {
+                return (canonical, false)
+            }
+        }
+        return (canonical, true)
+    }
+
+    func openSubfolder(_ name: String) async {
+        guard isReady else { return }
+        let next = SFTPPath.join(currentPath, name)
+        _ = await selectPath(next, scanSubfolders: true)
+    }
+
+    func navigateUp() async {
+        guard isReady, let parent = parentPath else { return }
+        _ = await selectPath(parent, scanSubfolders: true)
+    }
+
+    func createSubfolder(named rawName: String) async -> Bool {
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed == "." || trimmed == ".." || trimmed.contains("/") || trimmed.contains("\\") {
+            errorMessage = "Folder names cannot contain “/”, “\\”, or “..”."
+            return false
+        }
+        guard isReady, let sftp = controlSFTP, sftp.isActive else { return false }
+        let newPath = SFTPPath.join(currentPath, trimmed)
+        errorMessage = nil
+        isLoadingFolder = true
+        do {
+            try await withTimeout(15, timeoutMessage: "Creating the remote folder timed out") {
+                try await sftp.createDirectory(atPath: newPath)
+            }
+            currentPath = newPath
+            allDiscoveredSubfolders = []
+            subfolders = []
+            hasHiddenSubfolders = false
+            hasScannedCurrentFolder = true
+            isWritable = true
+            isReady = true
+            isLoadingFolder = false
+            return true
+        } catch {
+            isLoadingFolder = false
+            let mapped = SFTPBackend.map(error, pinned: false)
+            errorMessage = "Could not create folder “\(trimmed)”: \(mapped.localizedDescription)"
+            return false
+        }
+    }
+
+    func loadSubfolders() {
+        guard isReady, let ssh = sshClient, let fallbackSFTP = controlSFTP else { return }
+        cancelSubfolderScan()
+        let targetPath = currentPath
+        isScanningSubfolders = true
+        errorMessage = nil
+
+        scanTask = Task { @MainActor [weak self] in
+            var dedicatedChannel: SFTPClient?
+            do {
+                if let opened = try? await withTimeout(6, { try await ssh.openSFTP() }) {
+                    dedicatedChannel = opened
+                    self?.activeScanChannel = opened
+                }
+                let channel = dedicatedChannel ?? fallbackSFTP
+                let dirs = try await Self.fetchDirectoryNamesOnly(using: channel, atPath: targetPath)
+                if let dedicatedChannel {
+                    self?.activeScanChannel = nil
+                    Task.detached(priority: .utility) {
+                        try? await withTimeout(3) { try await dedicatedChannel.close() }
+                    }
+                }
+                guard let self, !Task.isCancelled, self.currentPath == targetPath else { return }
+                self.allDiscoveredSubfolders = dirs
+                self.hasHiddenSubfolders = dirs.contains { $0.hasPrefix(".") }
+                self.applySubfolderFilter()
+                self.hasScannedCurrentFolder = true
+                self.isScanningSubfolders = false
+            } catch is CancellationError {
+                self?.isScanningSubfolders = false
+            } catch {
+                if let dedicatedChannel {
+                    self?.activeScanChannel = nil
+                    Task.detached(priority: .utility) {
+                        try? await withTimeout(3) { try await dedicatedChannel.close() }
+                    }
+                }
+                guard let self, !Task.isCancelled, self.currentPath == targetPath else { return }
+                self.isScanningSubfolders = false
+                let mapped = SFTPBackend.map(error, pinned: false)
+                self.errorMessage = "Could not list subfolders: \(mapped.localizedDescription)"
+            }
+        }
+    }
+
+    private func applySubfolderFilter() {
+        let filtered = showHiddenFolders
+            ? allDiscoveredSubfolders
+            : allDiscoveredSubfolders.filter { !$0.hasPrefix(".") }
+        subfolders = filtered.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    nonisolated private static func fetchDirectoryNamesOnly(
+        using sftp: SFTPClient,
+        atPath targetPath: String
+    ) async throws -> [String] {
+        let packets = try await withTimeout(90, timeoutMessage: "Listing SFTP subfolders timed out") {
+            try await sftp.listDirectory(atPath: targetPath)
+        }
+        var seen = Set<String>()
+        var dirs: [String] = []
+        var symlinkCandidates: [String] = []
+
+        for packet in packets {
+            if Task.isCancelled { throw CancellationError() }
+            for comp in packet.components {
+                let name = comp.filename
+                if name.isEmpty || name == "." || name == ".." { continue }
+                guard seen.insert(name).inserted else { continue }
+
+                let ftype = (comp.attributes.permissions ?? 0) & 0o170000
+                let longFirst = comp.longname.first
+
+                if ftype == 0o040000 || longFirst == "d" {
+                    dirs.append(name)
+                } else if ftype == 0o120000 || longFirst == "l" {
+                    if symlinkCandidates.count < 64 {
+                        symlinkCandidates.append(name)
+                    }
+                }
+                // Regular files (`0o100000` / `"-"`) are skipped immediately without extra round-trips.
+            }
+        }
+
+        for linkName in symlinkCandidates {
+            if Task.isCancelled { throw CancellationError() }
+            let full = SFTPPath.join(targetPath, linkName)
+            if let attrs = try? await withTimeout(4, { try await sftp.getAttributes(at: full) }),
+               ((attrs.permissions ?? 0) & 0o170000) == 0o040000 {
+                dirs.append(linkName)
+            }
+        }
+
+        return dirs
+    }
+
+    func buildDestination(customName: String) -> (destination: Destination, password: String)? {
+        guard isReady, isWritable, !connectedHost.isEmpty, !connectedHostKey.isEmpty else { return nil }
+        let trimmedCustom = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalName = trimmedCustom.isEmpty ? defaultDestinationName : trimmedCustom
+        let dest = Destination(
+            name: finalName,
+            kind: .sftp,
+            host: connectedHost,
+            port: connectedPort,
+            username: connectedUsername,
+            remotePath: currentPath,
+            trustedHostKey: connectedHostKey
+        )
+        return (dest, connectedPassword)
+    }
+
+    private func closeConnection() async {
+        cancelSubfolderScan()
+        let sftp = controlSFTP
+        let ssh = sshClient
+        controlSFTP = nil
+        sshClient = nil
+        if let sftp {
+            _ = try? await withTimeout(3) { try await sftp.close() }
+        }
+        if let ssh {
+            _ = try? await withTimeout(3) { try await ssh.close() }
+        }
+    }
+
+    func resetToServerStep() async {
+        navTask?.cancel()
+        navTask = nil
+        await closeConnection()
+        allDiscoveredSubfolders = []
+        subfolders = []
+        hasHiddenSubfolders = false
+        hasScannedCurrentFolder = false
+        isReady = false
+        isWritable = true
+        errorMessage = nil
+    }
+
+    func cleanup() async {
+        userCancelledConnect = true
+        connectTask?.cancel()
+        navTask?.cancel()
+        await closeConnection()
     }
 }

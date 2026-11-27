@@ -26,7 +26,7 @@ struct DeleteOptionsView: View {
 
     private var measured: String {
         guard syncer.libraryBytes > 0, let at = syncer.libraryMeasuredAt else {
-            return "Not measured yet (measured after each sync while a budget is on)."
+            return "Not measured yet (measured when a budget is applied and after each sync)."
         }
         let size = ByteCountFormatter.string(fromByteCount: syncer.libraryBytes, countStyle: .file)
         return "Last measured: \(size) on \(at.formatted(date: .abbreviated, time: .shortened))"
@@ -266,12 +266,12 @@ struct DeleteOptionsView: View {
             if syncer.libraryBytes > targetBytes {
                 let lib = fmt(syncer.libraryBytes)
                 let excess = fmt(syncer.libraryBytes - targetBytes)
-                body = "Your last measured iCloud library is \(lib). On the next sync, PhotoSyncer will retroactively queue roughly \(excess) of your oldest verified synced photos and videos for deletion from iCloud (and all your devices) to bring the library under \(targetGB) GB."
+                body = "Your last measured iCloud library is \(lib). PhotoSyncer will immediately recalculate the deletion queue to include roughly \(excess) of your oldest verified synced photos and videos from iCloud (and all your devices) to bring the library under \(targetGB) GB."
             } else {
-                body = "With “Oldest synced files” selected, lowering the budget to \(targetGB) GB will retroactively queue your oldest verified synced photos and videos for deletion from iCloud (and all your devices) whenever your library exceeds \(targetGB) GB."
+                body = "With “Oldest synced files” selected, lowering the budget to \(targetGB) GB will immediately recalculate the deletion queue and retroactively queue your oldest verified synced photos and videos whenever your library exceeds \(targetGB) GB."
             }
         } else {
-            body = "With “Files that were just synced” selected, previously synced photos won't be deleted retroactively, but newly synced files will be queued for deletion from iCloud whenever your library exceeds \(targetGB) GB."
+            body = "With “Files that were just synced” selected, photos synced before deletion was enabled won't be deleted retroactively; PhotoSyncer will immediately recalculate the deletion queue from your session-synced items to match the \(targetGB) GB budget."
         }
         if !syncer.deleteAfterSync {
             body += "\n\n(“Delete from iCloud after sync” is currently off, so nothing will be deleted until it is enabled.)"
@@ -285,8 +285,8 @@ struct DeleteOptionsView: View {
         if syncer.libraryBytes > targetBytes {
             let lib = fmt(syncer.libraryBytes)
             let excess = fmt(syncer.libraryBytes - targetBytes)
-            return "Your last measured iCloud library is \(lib). On the next sync, PhotoSyncer will retroactively queue roughly \(excess) of your oldest verified synced photos and videos for deletion from iCloud (and all your devices) to bring the library under \(syncer.budgetGB) GB."
+            return "Your last measured iCloud library is \(lib). PhotoSyncer will immediately recalculate the deletion queue to retroactively queue roughly \(excess) of your oldest verified synced photos and videos for deletion from iCloud (and all your devices) to bring the library under \(syncer.budgetGB) GB."
         }
-        return "On the next sync, if your iCloud library exceeds \(syncer.budgetGB) GB, PhotoSyncer will retroactively queue your oldest already-synced verified photos and videos for deletion from iCloud (and all your devices) until the library is under \(syncer.budgetGB) GB."
+        return "If your iCloud library exceeds \(syncer.budgetGB) GB, PhotoSyncer will immediately recalculate the deletion queue and retroactively queue your oldest already-synced verified photos and videos for deletion from iCloud (and all your devices) until the library is under \(syncer.budgetGB) GB."
     }
 }

@@ -60,8 +60,12 @@ struct LogView: View {
                     .id(e.id)
                 }
                 .overlay { if shown.isEmpty { Text("No log entries").foregroundStyle(.secondary) } }
-                .onAppear { scrollToEnd(proxy) }
-                .onChange(of: log.events.count) { scrollToEnd(proxy) }
+                .onAppear {
+                    DispatchQueue.main.async { scrollToEnd(proxy) }
+                }
+                .onChange(of: log.events.count) {
+                    DispatchQueue.main.async { scrollToEnd(proxy) }
+                }
             }
         }
         .frame(minWidth: 700, minHeight: 360)

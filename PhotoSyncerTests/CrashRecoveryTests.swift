@@ -439,4 +439,214 @@ struct CrashRecoveryTests {
         }
         #expect(threwAfterClose == true)
     }
+
+    @Test func smbWizardEndpointAndNetFSShareEnumerationParsing() throws {
+        // Plain host, host:port, smb:// URL with user/share/subfolders, and Windows UNC path.
+        #expect(SMBServerEndpoint.parse("   ") == nil)
+        #expect(SMBServerEndpoint.parse("nas.local") == SMBServerEndpoint(
+            host: "nas.local", port: 445, usernameHint: nil, shareHint: nil, subfolderHint: []
+        ))
+        #expect(SMBServerEndpoint.parse("192.168.1.20:10445") == SMBServerEndpoint(
+            host: "192.168.1.20", port: 10445, usernameHint: nil, shareHint: nil, subfolderHint: []
+        ))
+        #expect(SMBServerEndpoint.parse("smb://alice@synology.local/Media/Photos/2026") == SMBServerEndpoint(
+            host: "synology.local", port: 445, usernameHint: "alice", shareHint: "Media", subfolderHint: ["Photos", "2026"]
+        ))
+        #expect(SMBServerEndpoint.parse("\\\\192.168.1.50\\Backups\\iPhone") == SMBServerEndpoint(
+            host: "192.168.1.50", port: 445, usernameHint: nil, shareHint: "Backups", subfolderHint: ["iPhone"]
+        ))
+
+        // Domain/username normalization & live smb.bundle NetFS URL construction.
+        #expect(SMBBackend.normalizeNetFSUsername("alice") == "alice")
+        #expect(SMBBackend.normalizeNetFSUsername("  WORKGROUP\\alice  ") == "WORKGROUP;alice")
+        #expect(SMBBackend.normalizeNetFSUsername("CORP;bob") == "CORP;bob")
+
+        let serverURL = try SMBBackend.buildNetFSServerURL(
+            host: "192.168.68.53",
+            port: 445,
+            share: "icloud",
+            guest: false,
+            username: "WORKGROUP\\alice",
+            password: "p@ss:w/rd#1"
+        )
+        #expect(serverURL.scheme?.lowercased() == "smb")
+        #expect(serverURL.host == "192.168.68.53")
+        #expect(serverURL.path == "/icloud")
+        #expect(serverURL.absoluteString.contains("WORKGROUP;alice:"))
+
+        // Verify -128 (userCanceledErr) and EPERM are not misreported as wrong credentials.
+        let canceledMsg = SMBBackend.mapMountError(-128, host: "192.168.68.53", share: "icloud").localizedDescription
+        #expect(canceledMsg.contains("login failed") == false)
+
+        // Verify POSIX directory-only scanner skips regular files, hidden entries, and file symlinks.
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PhotoSyncerSubdirScan-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        for name in ["2025", "2026", "Family", ".hiddenDir"] {
+            try FileManager.default.createDirectory(
+                at: tempRoot.appendingPathComponent(name, isDirectory: true),
+                withIntermediateDirectories: false
+            )
+        }
+        for i in 0..<500 {
+            FileManager.default.createFile(
+                atPath: tempRoot.appendingPathComponent("IMG_\(i).JPG").path,
+                contents: Data()
+            )
+        }
+        let scannedDirs = try SMBBackend.listSubdirectories(at: tempRoot)
+        #expect(scannedDirs == ["2025", "2026", "Family"])
+
+        let boundedScan = try SMBBackend.scanSubdirectories(at: tempRoot, maxNonDirectoryEntries: 100)
+        #expect(boundedScan.stoppedEarlyDueToManyFiles == true)
+
+        // NetFS EnumerateShares dictionary filtering (excludes IPC$ and PrinterShare; handles $ hidden shares).
+        let rawShares: [String: Any] = [
+            "IPC$": ["IsHidden": true],
+            "OfficePrinter": ["PrinterShare": true],
+            "ADMIN$": ["IsHidden": true],
+            "Photos$": [:] as [String: Any],
+            "media": ["DisplayName": "Media Library"],
+            "Backups": [:] as [String: Any],
+        ]
+        let visibleOnly = SMBBackend.parseEnumeratedShares(rawShares, includeHidden: false)
+        #expect(visibleOnly.map(\.name) == ["Backups", "media"])
+        #expect(visibleOnly.map(\.displayName) == ["Backups", "Media Library"])
+
+        let withHidden = SMBBackend.parseEnumeratedShares(rawShares, includeHidden: true)
+        #expect(withHidden.map(\.name) == ["ADMIN$", "Backups", "media", "Photos$"])
+        #expect(withHidden.contains { $0.name == "IPC$" } == false)
+        #expect(withHidden.contains { $0.name == "OfficePrinter" } == false)
+    }
+
+    @Test func sftpWizardEndpointAndPathNavigation() {
+        #expect(SFTPServerEndpoint.parse("  ") == nil)
+        #expect(SFTPServerEndpoint.parse("http://nas.local") == nil)
+        #expect(SFTPServerEndpoint.parse("nas.local") == SFTPServerEndpoint(
+            host: "nas.local", port: 22, usernameHint: nil, pathHint: nil
+        ))
+        #expect(SFTPServerEndpoint.parse("192.168.1.20:2222") == SFTPServerEndpoint(
+            host: "192.168.1.20", port: 2222, usernameHint: nil, pathHint: nil
+        ))
+        #expect(SFTPServerEndpoint.parse("alice@synology.local:/volume1/Photos/2026") == SFTPServerEndpoint(
+            host: "synology.local", port: 22, usernameHint: "alice", pathHint: "/volume1/Photos/2026"
+        ))
+        #expect(SFTPServerEndpoint.parse("alice@synology.local:~/Backups") == SFTPServerEndpoint(
+            host: "synology.local", port: 22, usernameHint: "alice", pathHint: "~/Backups"
+        ))
+        #expect(SFTPServerEndpoint.parse("sftp://bob@10.0.0.5:2022/mnt/media") == SFTPServerEndpoint(
+            host: "10.0.0.5", port: 2022, usernameHint: "bob", pathHint: "/mnt/media"
+        ))
+
+        #expect(SFTPPath.normalize("///volume1//Photos/../Backups/.//") == "/volume1/Backups")
+        #expect(SFTPPath.normalize("/../../..") == "/")
+        #expect(SFTPPath.resolve("~/iPhone", relativeTo: "/var", homePath: "/home/alice") == "/home/alice/iPhone")
+        #expect(SFTPPath.resolve("2026/Trips", relativeTo: "/home/alice/Photos", homePath: "/home/alice") == "/home/alice/Photos/2026/Trips")
+        #expect(SFTPPath.parent(of: "/home/alice") == "/home")
+        #expect(SFTPPath.parent(of: "/home") == "/")
+        #expect(SFTPPath.parent(of: "/") == nil)
+        #expect(SFTPPath.breadcrumbs(for: "/volume1/Photos").map(\.fullPath) == ["/", "/volume1", "/volume1/Photos"])
+    }
+
+    @Test func deleteBudgetBatchRecalculationAcrossBudgetAndStyleChanges() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let gb: Int64 = 1_000_000_000
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let store = SyncedStore(legacyDestinationID: nil, directory: dir)
+        // p1..p6 are verified 10 GB assets (60 GB total); u0 is an older unverified asset (40 GB) -> 100 GB library.
+        store.recordSynced(
+            id: "u0",
+            entry: Entry(parts: [Part(hash: "hu0", type: 1, size: UInt64(40 * gb))], verified: false),
+            fingerprint: nil
+        )
+        for i in 1...6 {
+            let id = "p\(i)"
+            store.recordSynced(
+                id: id,
+                entry: Entry(parts: [Part(hash: "h\(i)", type: 1, size: UInt64(10 * gb))], verified: true),
+                fingerprint: "fp-\(i)"
+            )
+        }
+
+        let measured: [LibraryItem] = [
+            LibraryItem(id: "u0", date: t0, bytes: 40 * gb),
+            LibraryItem(id: "p1", date: t0.addingTimeInterval(10), bytes: 10 * gb),
+            LibraryItem(id: "p2", date: t0.addingTimeInterval(20), bytes: 10 * gb),
+            LibraryItem(id: "p3", date: t0.addingTimeInterval(30), bytes: 10 * gb),
+            LibraryItem(id: "p4", date: t0.addingTimeInterval(40), bytes: 10 * gb),
+            LibraryItem(id: "p5", date: t0.addingTimeInterval(50), bytes: 10 * gb),
+            LibraryItem(id: "p6", date: t0.addingTimeInterval(60), bytes: 10 * gb),
+        ]
+        let totalBytes: Int64 = 100 * gb
+
+        // 1. `.justSynced`: p1..p2 were synced before deletion was enabled; p3..p6 synced after enabling deletion.
+        store.addJustSyncedCandidates(["u0", "p3", "p4", "p5", "p6"])
+        #expect(store.justSyncedCandidates == ["p3", "p4", "p5", "p6"])
+
+        // Initial 60 GB budget (40 GB excess) queues p3..p6 (never retroactive p1..p2 or unverified u0).
+        let b60 = store.recalculateDeleteQueue(
+            deleteStyle: .justSynced, budgetEnabled: true, budgetGB: 60,
+            measuredItems: measured, totalBytes: totalBytes
+        )
+        #expect(b60 == DeleteBatchPlan(queuedIDs: ["p3", "p4", "p5", "p6"], queuedBytes: 40 * gb, excessBytes: 40 * gb))
+        #expect(store.pendingDelete == ["p3", "p4", "p5", "p6"])
+
+        // 2. Raising budget to 85 GB (15 GB excess) immediately trims batch to oldest 2 candidates (20 GB >= 15 GB).
+        store.clearDeleteQueue(clearCandidates: false)
+        let b85 = store.recalculateDeleteQueue(
+            deleteStyle: .justSynced, budgetEnabled: true, budgetGB: 85,
+            measuredItems: measured, totalBytes: totalBytes
+        )
+        #expect(b85 == DeleteBatchPlan(queuedIDs: ["p3", "p4"], queuedBytes: 20 * gb, excessBytes: 15 * gb))
+        #expect(store.pendingDelete == ["p3", "p4"])
+        #expect(store.justSyncedCandidates == ["p3", "p4", "p5", "p6"])
+        #expect(store.save())
+
+        // Reload from disk and raise budget to 110 GB (within budget -> 0 queued, candidates still preserved).
+        let reloaded = SyncedStore(legacyDestinationID: nil, directory: dir)
+        reloaded.clearDeleteQueue(clearCandidates: false)
+        let b110 = reloaded.recalculateDeleteQueue(
+            deleteStyle: .justSynced, budgetEnabled: true, budgetGB: 110,
+            measuredItems: measured, totalBytes: totalBytes
+        )
+        #expect(b110 == DeleteBatchPlan(queuedIDs: [], queuedBytes: 0, excessBytes: 0))
+        #expect(reloaded.pendingDelete.isEmpty)
+        #expect(reloaded.justSyncedCandidates == ["p3", "p4", "p5", "p6"])
+
+        // 3. Lowering budget to 75 GB (25 GB excess) restores 30 GB (p3..p5) from preserved candidates.
+        let b75 = reloaded.recalculateDeleteQueue(
+            deleteStyle: .justSynced, budgetEnabled: true, budgetGB: 75,
+            measuredItems: measured, totalBytes: totalBytes
+        )
+        #expect(b75 == DeleteBatchPlan(queuedIDs: ["p3", "p4", "p5"], queuedBytes: 30 * gb, excessBytes: 25 * gb))
+        #expect(reloaded.pendingDelete == ["p3", "p4", "p5"])
+
+        // 4. Turning budget off under `.justSynced` queues all live verified session candidates (p3..p6).
+        let noBudget = reloaded.recalculateDeleteQueue(
+            deleteStyle: .justSynced, budgetEnabled: false, budgetGB: 75,
+            measuredItems: measured, totalBytes: totalBytes
+        )
+        #expect(noBudget == DeleteBatchPlan(queuedIDs: ["p3", "p4", "p5", "p6"], queuedBytes: 40 * gb, excessBytes: 0))
+
+        // 5. Switching to `.oldest` at 75 GB budget (25 GB excess) queues retroactive oldest verified items (p1..p3), skipping unverified u0.
+        let oldest75 = reloaded.recalculateDeleteQueue(
+            deleteStyle: .oldest, budgetEnabled: true, budgetGB: 75,
+            measuredItems: measured, totalBytes: totalBytes
+        )
+        #expect(oldest75 == DeleteBatchPlan(queuedIDs: ["p1", "p2", "p3"], queuedBytes: 30 * gb, excessBytes: 25 * gb))
+        #expect(reloaded.pendingDelete == ["p1", "p2", "p3"])
+
+        // 6. Dequeuing deleted items removes them from both pendingDelete and justSyncedCandidates; disabling deletion clears all.
+        reloaded.dequeueDelete(["p3"])
+        #expect(!reloaded.pendingDelete.contains("p3"))
+        #expect(!reloaded.justSyncedCandidates.contains("p3"))
+        reloaded.clearDeleteQueue(clearCandidates: true)
+        #expect(reloaded.pendingDelete.isEmpty)
+        #expect(reloaded.justSyncedCandidates.isEmpty)
+    }
 }

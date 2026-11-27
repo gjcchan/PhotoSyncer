@@ -27,6 +27,69 @@ struct Failure: Codable {
     var parked: Bool?     // true = gave up auto-retrying; only a manual retry brings it back
 }
 
+struct DeleteBatchPlan: Equatable {
+    /// Asset IDs selected for `pendingDelete`, ordered oldest → newest.
+    var queuedIDs: [String]
+    /// Sum of measured sizes for `queuedIDs`.
+    var queuedBytes: Int64
+    /// Bytes by which `totalBytes` exceeds the active budget (0 when within budget or budget is off).
+    var excessBytes: Int64
+}
+
+enum DeleteBudgetPlanner {
+    /// Computes the deletion batch matching `deleteStyle`, `budgetEnabled`, and `budgetGB`.
+    /// - Only eligible (verified, non-legacy, non-empty) items are ever returned.
+    /// - Under `.justSynced`, candidates are restricted to `justSyncedCandidates`.
+    /// - When `budgetEnabled` is true, walks eligible items oldest → newest until `queuedBytes >= excessBytes`
+    ///   (or returns an empty batch when `totalBytes <= budgetBytes`).
+    /// - When `budgetEnabled` is false (under `.justSynced`), returns all eligible `justSyncedCandidates`.
+    static func plan(
+        deleteStyle: DeleteStyle,
+        budgetEnabled: Bool,
+        budgetGB: Int,
+        measuredItems: [LibraryItem],
+        totalBytes: Int64,
+        justSyncedCandidates: Set<String>,
+        isEligible: (String) -> Bool
+    ) -> DeleteBatchPlan {
+        let ordered = measuredItems.enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.date != rhs.element.date {
+                    return lhs.element.date < rhs.element.date
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+
+        if !budgetEnabled && deleteStyle == .justSynced {
+            var ids: [String] = []
+            var bytes: Int64 = 0
+            for item in ordered where justSyncedCandidates.contains(item.id) && isEligible(item.id) {
+                ids.append(item.id)
+                bytes += max(0, item.bytes)
+            }
+            return DeleteBatchPlan(queuedIDs: ids, queuedBytes: bytes, excessBytes: 0)
+        }
+
+        let budgetBytes = Int64(max(budgetGB, 1)) * 1_000_000_000
+        let excess = totalBytes - budgetBytes
+        guard excess > 0 else {
+            return DeleteBatchPlan(queuedIDs: [], queuedBytes: 0, excessBytes: 0)
+        }
+
+        var ids: [String] = []
+        var freed: Int64 = 0
+        for item in ordered {
+            if freed >= excess { break }
+            if deleteStyle == .justSynced && !justSyncedCandidates.contains(item.id) { continue }
+            guard isEligible(item.id) else { continue }
+            ids.append(item.id)
+            freed += max(0, item.bytes)
+        }
+        return DeleteBatchPlan(queuedIDs: ids, queuedBytes: freed, excessBytes: excess)
+    }
+}
+
 /// Persistent ledger, content-addressed per destination:
 /// an asset is fully synced to a destination when every one of its part hashes has a file there.
 /// That makes recovery simple: lose a file at one destination and only that destination re-syncs.
@@ -44,6 +107,7 @@ final class SyncedStore {
         var fingerprints: [String: [Part]] = [:]                // survives Photos-ID changes
         var failures: [String: Failure] = [:]
         var pendingDelete: Set<String> = []
+        var justSyncedCandidates: Set<String> = []              // verified assets synced while deletion is on (survives budget resizing)
         var needsRebuild = false
         var duplicates: Int?
         var extraNames: [String: Set<String>] = [:]             // other names of already-known content, per destination
@@ -53,7 +117,7 @@ final class SyncedStore {
         var canaryWritten: Set<String> = []                     // destination keys with `.photosyncer-id` written
 
         enum CodingKeys: String, CodingKey {
-            case entries, placements, fingerprints, failures, pendingDelete, needsRebuild, duplicates
+            case entries, placements, fingerprints, failures, pendingDelete, justSyncedCandidates, needsRebuild, duplicates
             case extraNames, previews, retiredPreviews, hashSizes, canaryWritten
         }
 
@@ -67,6 +131,7 @@ final class SyncedStore {
             fingerprints = try c.decodeIfPresent([String: [Part]].self, forKey: .fingerprints) ?? [:]
             failures = try c.decodeIfPresent([String: Failure].self, forKey: .failures) ?? [:]
             pendingDelete = try c.decodeIfPresent(Set<String>.self, forKey: .pendingDelete) ?? []
+            justSyncedCandidates = try c.decodeIfPresent(Set<String>.self, forKey: .justSyncedCandidates) ?? []
             needsRebuild = try c.decodeIfPresent(Bool.self, forKey: .needsRebuild) ?? false
             duplicates = try c.decodeIfPresent(Int.self, forKey: .duplicates)
             extraNames = try c.decodeIfPresent([String: Set<String>].self, forKey: .extraNames) ?? [:]
@@ -209,6 +274,7 @@ final class SyncedStore {
     var duplicateCount: Int { ledger.duplicates ?? 0 }
     func noteDuplicate() { ledger.duplicates = (ledger.duplicates ?? 0) + 1 }
     var pendingDelete: Set<String> { ledger.pendingDelete }
+    var justSyncedCandidates: Set<String> { ledger.justSyncedCandidates }
     var failureCount: Int { ledger.failures.values.filter { $0.cloud != true }.count }
     /// iCloud-waiting items that are still being retried automatically.
     var cloudWaitingCount: Int { ledger.failures.values.filter { $0.cloud == true && $0.parked != true }.count }
@@ -345,9 +411,62 @@ final class SyncedStore {
         if let fp = fingerprint, entry.verified { ledger.fingerprints[fp] = entry.parts }
     }
 
+    func isVerifiedForQueue(_ id: String) -> Bool {
+        guard let e = ledger.entries[id], e.verified, e.legacy != true, !e.parts.isEmpty else { return false }
+        return true
+    }
+
+    func addJustSyncedCandidates<S: Sequence>(_ ids: S) where S.Element == String {
+        for id in ids where isVerifiedForQueue(id) {
+            ledger.justSyncedCandidates.insert(id)
+        }
+    }
+
+    func pruneJustSyncedCandidates(keeping live: Set<String>) {
+        ledger.justSyncedCandidates.formIntersection(live)
+    }
+
     func queueDelete(_ id: String) { ledger.pendingDelete.insert(id) }
-    func dequeueDelete<S: Sequence>(_ ids: S) where S.Element == String { ledger.pendingDelete.subtract(ids) }
-    func clearDeleteQueue() { ledger.pendingDelete.removeAll() }
+
+    func replaceDeleteQueue<S: Sequence>(_ ids: S) where S.Element == String {
+        ledger.pendingDelete = Set(ids)
+    }
+
+    func dequeueDelete<S: Sequence>(_ ids: S) where S.Element == String {
+        ledger.pendingDelete.subtract(ids)
+        ledger.justSyncedCandidates.subtract(ids)
+    }
+
+    func clearDeleteQueue(clearCandidates: Bool = true) {
+        ledger.pendingDelete.removeAll()
+        if clearCandidates {
+            ledger.justSyncedCandidates.removeAll()
+        }
+    }
+
+    /// Recomputes `pendingDelete` in place from `measuredItems` to match the active deletion policy and budget.
+    @discardableResult
+    func recalculateDeleteQueue(
+        deleteStyle: DeleteStyle,
+        budgetEnabled: Bool,
+        budgetGB: Int,
+        measuredItems: [LibraryItem],
+        totalBytes: Int64
+    ) -> DeleteBatchPlan {
+        let liveIDs = Set(measuredItems.map(\.id))
+        pruneJustSyncedCandidates(keeping: liveIDs)
+        let batch = DeleteBudgetPlanner.plan(
+            deleteStyle: deleteStyle,
+            budgetEnabled: budgetEnabled,
+            budgetGB: budgetGB,
+            measuredItems: measuredItems,
+            totalBytes: totalBytes,
+            justSyncedCandidates: ledger.justSyncedCandidates,
+            isEligible: { [weak self] id in self?.isVerifiedForQueue(id) == true }
+        )
+        ledger.pendingDelete = Set(batch.queuedIDs)
+        return batch
+    }
 
     /// iCloud-waiting items are retried every 5 minutes for their first few attempts (a download in
     /// progress usually resolves quickly). If it keeps failing the cause is not transient, so they
