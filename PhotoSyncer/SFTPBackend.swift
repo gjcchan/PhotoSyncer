@@ -36,6 +36,79 @@ private nonisolated struct PipelinedSFTPFile: @unchecked Sendable {
     let file: SFTPFile
 }
 
+/// `SSHClient`'s internal `SSHClientSession` and `EventLoop` are `Sendable`; wraps `SSHClient` for `withTimeout`.
+private nonisolated struct SendableSSHClient: @unchecked Sendable {
+    let client: SSHClient
+}
+
+/// Coordinates one-time SSH `exec` SHA-256 capability probing and caps concurrent `exec` channels
+/// (`<= 2` alongside up to `4` SFTP channels, staying safely under OpenSSH's default `MaxSessions = 10`).
+private actor RemoteExecHashCoordinator {
+    struct VerifiedHasher: Sendable {
+        var tool: SFTPRemoteHash.Tool
+        var execBase: String
+    }
+
+    private enum ProbeState {
+        case unprobed
+        case probing([CheckedContinuation<VerifiedHasher?, Never>])
+        case verified(VerifiedHasher)
+        case unsupported
+    }
+
+    private let maxConcurrentExec = 2
+    private var probeState: ProbeState = .unprobed
+    private var activeExecs = 0
+    private var execWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func resolveHasher(
+        probe: @Sendable () async -> VerifiedHasher?
+    ) async -> VerifiedHasher? {
+        switch probeState {
+        case .verified(let h):
+            return h
+        case .unsupported:
+            return nil
+        case .probing(var waiters):
+            return await withCheckedContinuation { cont in
+                waiters.append(cont)
+                probeState = .probing(waiters)
+            }
+        case .unprobed:
+            probeState = .probing([])
+            let discovered = await probe()
+            let waiting: [CheckedContinuation<VerifiedHasher?, Never>]
+            if case .probing(let list) = probeState {
+                waiting = list
+            } else {
+                waiting = []
+            }
+            if let discovered {
+                probeState = .verified(discovered)
+            } else {
+                probeState = .unsupported
+            }
+            for w in waiting { w.resume(returning: discovered) }
+            return discovered
+        }
+    }
+
+    func withExecSlot<T: Sendable>(_ op: @Sendable () async throws -> T) async rethrows -> T {
+        if activeExecs >= maxConcurrentExec {
+            await withCheckedContinuation { execWaiters.append($0) }
+        }
+        activeExecs += 1
+        defer {
+            activeExecs = max(0, activeExecs - 1)
+            if !execWaiters.isEmpty {
+                let next = execWaiters.removeFirst()
+                next.resume()
+            }
+        }
+        return try await op()
+    }
+}
+
 private nonisolated final class AtomicFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var flag = false
@@ -64,6 +137,8 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
     private let stateLock = NSLock()
     private var ssh: SSHClient?
     private var pool: AsyncResourcePool<SFTPClient>?
+    private var execHashCoordinator: RemoteExecHashCoordinator?
+    private var resolvedSFTPBase: String?
     /// Strict SFTP v3 servers reject Citadel's rename (it always sends a v5-style flags field).
     /// Once we see that, files are written under their final name directly, guarded by a marker.
     private let renameUnsupported = AtomicFlag()
@@ -84,10 +159,19 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
         stateLock.withLock { pool }
     }
 
-    private func setSession(ssh client: SSHClient, pool createdPool: AsyncResourcePool<SFTPClient>) {
+    private func currentExecSession() -> (SendableSSHClient, RemoteExecHashCoordinator, String?)? {
+        stateLock.withLock {
+            guard let ssh, let execHashCoordinator else { return nil }
+            return (SendableSSHClient(client: ssh), execHashCoordinator, resolvedSFTPBase)
+        }
+    }
+
+    private func setSession(ssh client: SSHClient, pool createdPool: AsyncResourcePool<SFTPClient>, realBase: String?) {
         stateLock.withLock {
             ssh = client
             pool = createdPool
+            execHashCoordinator = RemoteExecHashCoordinator()
+            resolvedSFTPBase = realBase
         }
     }
 
@@ -97,6 +181,8 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
             let c = ssh
             pool = nil
             ssh = nil
+            execHashCoordinator = nil
+            resolvedSFTPBase = nil
             return (p, c)
         }
     }
@@ -150,6 +236,8 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
             throw error
         }
 
+        let realBase = try? await withTimeout(10) { try await primarySFTP.getRealPath(atPath: self.listPath) }
+
         // Open up to `targetChannels` multiplexed SFTP subsystem channels over the single SSH session
         // (OpenSSH defaults to MaxSessions = 10; if a server caps MaxSessions lower, fall back cleanly).
         var channels: [SFTPClient] = [primarySFTP]
@@ -161,7 +249,7 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
             }
         }
 
-        setSession(ssh: client, pool: AsyncResourcePool(channels))
+        setSession(ssh: client, pool: AsyncResourcePool(channels), realBase: realBase)
     }
 
     fileprivate static func map(_ error: Error, pinned: Bool) -> Error {
@@ -242,10 +330,12 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
 
     func freeSpace() async -> Int64? { nil }     // not available over plain SFTP
 
-    // MARK: Pipelined Transfer & Verification
-    /// Streams `local` to `remote` using an 8 × 32 KB pipelined write window, then reads every byte
-    /// back with an 8 × 32 KB pipelined read window to prove size + SHA-256 on the server.
-    private func writeAndVerify(using sftp: SFTPClient, local: URL, to remote: String, size: UInt64, hash: String) async throws {
+    // MARK: Pipelined Transfer & Server-Side / Fallback Verification
+    /// Streams `local` to `remote` using an 8 × 32 KB pipelined write window, then verifies exact
+    /// size + SHA-256 on the server (using server-side SSH `exec` hashing when available, or falling
+    /// back to an 8 × 32 KB pipelined SFTP read-back on SFTP-only servers).
+    private func writeAndVerify(using sftp: SFTPClient, local: URL, fileName: String, size: UInt64, hash: String) async throws {
+        let remote = path(fileName)
         var openHandle: SFTPFile?
         do {
             let f = try await withTimeout(30) { try await sftp.openFile(filePath: remote, flags: [.write, .create, .truncate]) }
@@ -268,7 +358,7 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
             guard written == size else {
                 throw SyncError.message("Copy verification failed: size mismatch on the SFTP server")
             }
-            let (readHash, readSize) = try await remoteHashAndSize(using: sftp, remotePath: remote, knownSize: size)
+            let (readHash, readSize) = try await remoteHashAndSize(using: sftp, fileName: fileName, knownSize: size)
             guard readSize == size else {
                 throw SyncError.message("Copy verification failed: size mismatch on the SFTP server")
             }
@@ -297,17 +387,18 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
 
         if !renameUnsupported.value {
             let token = UUID().uuidString.prefix(8)
-            let partial = path(".\(name).\(token).partial")
+            let partialName = ".\(name).\(token).partial"
+            let partial = path(partialName)
             var renamed = false
             do {
-                try await writeAndVerify(using: sftp, local: local, to: partial, size: size, hash: hash)
+                try await writeAndVerify(using: sftp, local: local, fileName: partialName, size: size, hash: hash)
                 do {
                     try await withTimeout(30) { try await sftp.rename(at: partial, to: final) }
                     renamed = true
                     return
                 } catch is SFTPMessage.Status {
                     if (try? await withTimeout(30) { try await sftp.getAttributes(at: final) }) != nil {
-                        let matches = (try? await remoteHashAndSize(using: sftp, remotePath: final, knownSize: size).hash) == hash
+                        let matches = (try? await remoteHashAndSize(using: sftp, fileName: name, knownSize: size).hash) == hash
                         await removeQuietly(using: sftp, partial)
                         if matches { return }
                         throw SyncError.message("\(name) already exists on the SFTP server")
@@ -328,13 +419,13 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
             await removeQuietly(using: sftp, marker)
         }
         if (try? await withTimeout(30) { try await sftp.getAttributes(at: final) }) != nil {
-            if (try? await remoteHashAndSize(using: sftp, remotePath: final, knownSize: size).hash) == hash { return }
+            if (try? await remoteHashAndSize(using: sftp, fileName: name, knownSize: size).hash) == hash { return }
             throw SyncError.message("\(name) already exists on the SFTP server")
         }
         do {
             let m = try await withTimeout(30) { try await sftp.openFile(filePath: marker, flags: [.write, .create, .truncate]) }
             try await withTimeout(30) { try await m.close() }
-            try await writeAndVerify(using: sftp, local: local, to: final, size: size, hash: hash)
+            try await writeAndVerify(using: sftp, local: local, fileName: name, size: size, hash: hash)
             await removeQuietly(using: sftp, marker)
         } catch {
             await removeQuietly(using: sftp, final)
@@ -343,7 +434,109 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
         }
     }
 
-    private func remoteHashAndSize(using sftp: SFTPClient, remotePath: String, knownSize: UInt64?) async throws -> (hash: String, size: UInt64) {
+    private func remoteHashAndSize(using sftp: SFTPClient, fileName: String, knownSize: UInt64?) async throws -> (hash: String, size: UInt64) {
+        if let serverResult = try await serverSideHashAndSize(using: sftp, fileName: fileName, knownSize: knownSize) {
+            return serverResult
+        }
+        return try await streamRemoteHashAndSize(using: sftp, remotePath: path(fileName), knownSize: knownSize)
+    }
+
+    /// Computes `(hash, size)` on the destination server's CPU over the existing SSH session so the file
+    /// does not need to be downloaded back over the network. Returns `nil` when the server disallows SSH
+    /// `exec` (`internal-sftp`), has no SHA-256 CLI utility, or uses an isolated chroot path namespace.
+    private func serverSideHashAndSize(using sftp: SFTPClient, fileName: String, knownSize: UInt64?) async throws -> (hash: String, size: UInt64)? {
+        guard let (sshBox, coordinator, realBase) = currentExecSession() else { return nil }
+        let remotePath = path(fileName)
+
+        let attrs: SFTPFileAttributes
+        do {
+            attrs = try await withTimeout(30) { try await sftp.getAttributes(at: remotePath) }
+        } catch {
+            throw Self.map(error, pinned: pinnedKey != nil)
+        }
+        guard let actualSize = attrs.size else { return nil }
+        if let knownSize, actualSize != knownSize {
+            return ("", actualSize)
+        }
+        if actualSize == 0 {
+            return (SFTPRemoteHash.emptySHA256, 0)
+        }
+
+        let candidates = SFTPRemoteHash.candidateExecBases(sftpRealBase: realBase, configuredBase: base)
+        guard !candidates.isEmpty else { return nil }
+
+        let serverHost = host
+        let verified = await coordinator.resolveHasher {
+            // Read at most 4 KB of `remotePath` via SFTP (1 packet) so the one-time probe proves both
+            // tool correctness AND that SSH `exec` resolves `execBase` to the exact same file on disk.
+            let sampleLen = UInt32(min(actualSize, 4096))
+            let prefixData: Data
+            do {
+                let f = try await withTimeout(15) { try await sftp.openFile(filePath: remotePath, flags: .read) }
+                do {
+                    let buf = try await withTimeout(15) { try await f.read(from: 0, length: sampleLen) }
+                    try? await withTimeout(5) { try await f.close() }
+                    prefixData = Data(buf.readableBytesView)
+                } catch {
+                    try? await withTimeout(5) { try await f.close() }
+                    return nil
+                }
+            } catch {
+                return nil
+            }
+            guard !prefixData.isEmpty else { return nil }
+            let expectedPrefixHash = SHA256.hash(data: prefixData).map { String(format: "%02x", $0) }.joined()
+
+            for candidateBase in candidates {
+                let candidateFile = SFTPPath.join(candidateBase, fileName)
+                guard let cmd = SFTPRemoteHash.buildProbeCommand(
+                    samplePath: candidateFile,
+                    prefixByteCount: prefixData.count
+                ) else { continue }
+
+                guard let outBuf = try? await withTimeout(5, timeoutMessage: "SSH hash probe timed out", {
+                    try await sshBox.client.executeCommand(cmd, maxResponseSize: 4096, mergeStreams: false, inShell: false)
+                }) else {
+                    continue
+                }
+                if let parsed = SFTPRemoteHash.parseProbeOutput(String(buffer: outBuf)),
+                   parsed.digest == expectedPrefixHash {
+                    let toolName = parsed.tool.rawValue
+                    Task { @MainActor in
+                        EventLog.shared.info("\(serverHost): verified server-side SHA-256 (\(toolName)) over SSH")
+                    }
+                    return RemoteExecHashCoordinator.VerifiedHasher(tool: parsed.tool, execBase: candidateBase)
+                }
+            }
+            return nil
+        }
+
+        guard let verified else { return nil }
+        let execFile = SFTPPath.join(verified.execBase, fileName)
+        guard let cmd = SFTPRemoteHash.buildHashCommand(tool: verified.tool, path: execFile) else {
+            return nil
+        }
+
+        // Scale timeout by file size (~10 MB/s worst-case NAS disk read rate, minimum 30s, max 30m).
+        let hashTimeout = max(30.0, min(1800.0, 20.0 + Double(actualSize) / 10_000_000.0))
+        do {
+            let outBuf = try await coordinator.withExecSlot {
+                try await withTimeout(hashTimeout, timeoutMessage: "Remote SHA-256 timed out") {
+                    try await sshBox.client.executeCommand(cmd, maxResponseSize: 4096, mergeStreams: false, inShell: false)
+                }
+            }
+            guard let digest = SFTPRemoteHash.parseDigest(String(buffer: outBuf)) else {
+                return nil
+            }
+            return (digest, actualSize)
+        } catch {
+            // If the SFTP session itself is still alive (e.g. only an `exec` channel limit was hit),
+            // let `remoteHashAndSize` fall back to streaming over SFTP rather than aborting a valid file.
+            return nil
+        }
+    }
+
+    private func streamRemoteHashAndSize(using sftp: SFTPClient, remotePath: String, knownSize: UInt64?) async throws -> (hash: String, size: UInt64) {
         let resolvedSize: UInt64?
         if let knownSize {
             resolvedSize = knownSize
@@ -399,7 +592,7 @@ nonisolated final class SFTPBackend: DestinationBackend, @unchecked Sendable {
 
     func hash(of name: String, noCache: Bool) async throws -> String {
         try await withChannel { sftp in
-            (try await self.remoteHashAndSize(using: sftp, remotePath: self.path(name), knownSize: nil)).hash
+            (try await self.remoteHashAndSize(using: sftp, fileName: name, knownSize: nil)).hash
         }
     }
 

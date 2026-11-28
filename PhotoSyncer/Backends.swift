@@ -534,3 +534,119 @@ nonisolated enum SFTPPath {
         return crumbs
     }
 }
+
+/// Builds shell-safe remote SHA-256 commands and parses digests for `SFTPBackend`'s server-side
+/// SSH `exec` verification path (falling back to SFTP stream-back whenever `exec` is unavailable).
+nonisolated enum SFTPRemoteHash {
+    static let emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    enum Tool: String, CaseIterable, Equatable, Sendable {
+        case sha256sum
+        case shasum
+        case bsdSha256
+        case openssl
+    }
+
+    /// Quotes `raw` as a single-quoted POSIX `/bin/sh` literal (`'...'`), rejecting NUL/CR/LF bytes
+    /// so arbitrary filenames (`$()`, backticks, spaces, quotes, leading `-`) are 100% inert.
+    static func shellQuote(_ raw: String) -> String? {
+        guard !raw.isEmpty,
+              !raw.utf8.contains(0),
+              !raw.contains("\n"),
+              !raw.contains("\r") else {
+            return nil
+        }
+        return "'" + raw.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func invocation(for tool: Tool) -> String {
+        switch tool {
+        case .sha256sum: return "sha256sum"
+        case .shasum: return "shasum -a 256"
+        case .bsdSha256: return "sha256 -q"
+        case .openssl: return "openssl dgst -sha256"
+        }
+    }
+
+    /// One-time probe command that locates an installed SHA-256 tool AND hashes the first `prefixByteCount`
+    /// bytes of `samplePath` so the client can cryptographically prove `samplePath` in SSH `exec` is the
+    /// exact same file seen over SFTP (catching chrooted or virtualized SFTP roots).
+    static func buildProbeCommand(samplePath: String, prefixByteCount: Int) -> String? {
+        guard let quoted = shellQuote(samplePath), prefixByteCount >= 0 else { return nil }
+        let feed = prefixByteCount > 0
+            ? "dd bs=\(prefixByteCount) count=1 2>/dev/null < \"$p\""
+            : "cat /dev/null"
+        return [
+            "PATH=\"$PATH:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin\"",
+            "p=\(quoted)",
+            "[ -f \"$p\" ] || exit 2",
+            "if command -v sha256sum >/dev/null 2>&1; then t=sha256sum; h=$(\(feed) | sha256sum);"
+                + " elif command -v shasum >/dev/null 2>&1; then t=shasum; h=$(\(feed) | shasum -a 256);"
+                + " elif command -v sha256 >/dev/null 2>&1; then t=bsdSha256; h=$(\(feed) | sha256 -q);"
+                + " elif command -v openssl >/dev/null 2>&1; then t=openssl; h=$(\(feed) | openssl dgst -sha256);"
+                + " else exit 3; fi",
+            "printf '%s\\n%s\\n' \"$t\" \"$h\"",
+        ].joined(separator: "; ")
+    }
+
+    /// Per-file SHA-256 command using `< "$p"` stdin redirection so filenames beginning with `-` or
+    /// containing special characters are never interpreted as CLI flags or escaped in tool output.
+    static func buildHashCommand(tool: Tool, path: String) -> String? {
+        guard let quoted = shellQuote(path) else { return nil }
+        return "PATH=\"$PATH:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin\"; p=\(quoted); [ -f \"$p\" ] && \(invocation(for: tool)) < \"$p\""
+    }
+
+    /// Extracts a 64-character lowercase hex SHA-256 digest from `sha256sum`, `shasum -a 256`,
+    /// BSD `sha256 -q`, or `openssl dgst -sha256` output.
+    static func parseDigest(_ rawOutput: String) -> String? {
+        let lines = rawOutput
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard lines.count == 1, let line = lines.first else { return nil }
+        let tokens = line.split(whereSeparator: { $0.isWhitespace || $0 == "=" })
+        let hexTokens = tokens.filter { tok in
+            tok.count == 64 && tok.unicodeScalars.allSatisfy { s in
+                (s.value >= 48 && s.value <= 57)
+                    || (s.value >= 65 && s.value <= 70)
+                    || (s.value >= 97 && s.value <= 102)
+            }
+        }
+        guard hexTokens.count == 1, let match = hexTokens.first else { return nil }
+        return String(match).lowercased()
+    }
+
+    static func parseProbeOutput(_ rawOutput: String) -> (tool: Tool, digest: String)? {
+        let lines = rawOutput
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard lines.count == 2,
+              let tool = Tool(rawValue: lines[0]),
+              let digest = parseDigest(lines[1]) else {
+            return nil
+        }
+        return (tool, digest)
+    }
+
+    /// Ordered candidate directories in SSH `exec` namespace corresponding to SFTP's base folder.
+    static func candidateExecBases(sftpRealBase: String?, configuredBase: String) -> [String] {
+        var out: [String] = []
+        func appendUnique(_ raw: String) {
+            let norm = SFTPPath.normalize(raw)
+            if !out.contains(norm) { out.append(norm) }
+        }
+        if let sftpRealBase, !sftpRealBase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            appendUnique(sftpRealBase)
+        }
+        let trimmedBase = configuredBase.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedBase.hasPrefix("/") {
+            appendUnique(trimmedBase)
+        }
+        // Synology DSM SFTP exposes shared folders at `/<Share>` while SSH `exec` mounts them at `/volume1/<Share>`.
+        if let first = out.first, first != "/", !first.hasPrefix("/volume") {
+            appendUnique("/volume1" + first)
+        }
+        return out
+    }
+}

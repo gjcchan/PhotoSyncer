@@ -738,4 +738,72 @@ struct CrashRecoveryTests {
         #expect(!reloaded.isFailing("paused-item"))
         #expect(reloaded.isFailing("real-fail"))
     }
+
+    @Test func sftpServerSideHashCommandQuotingParsingAndLiveShellExecution() throws {
+        // Rejects empty, NUL, CR, LF strings so multi-line injection is impossible.
+        #expect(SFTPRemoteHash.shellQuote("") == nil)
+        #expect(SFTPRemoteHash.shellQuote("bad\nname") == nil)
+        #expect(SFTPRemoteHash.shellQuote("bad\rname") == nil)
+        #expect(SFTPRemoteHash.shellQuote("bad\0name") == nil)
+
+        // Parses all 4 remote digest output formats and rejects malformed output.
+        let d = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+        let lower = d.lowercased()
+        #expect(SFTPRemoteHash.parseDigest("\(lower)  -\n") == lower)
+        #expect(SFTPRemoteHash.parseDigest("\(lower) *-\n") == lower)
+        #expect(SFTPRemoteHash.parseDigest("\(d)\n") == lower)
+        #expect(SFTPRemoteHash.parseDigest("(stdin)= \(lower)\n") == lower)
+        #expect(SFTPRemoteHash.parseDigest("SHA2-256(stdin)= \(d)\n") == lower)
+        #expect(SFTPRemoteHash.parseDigest("not-a-digest") == nil)
+        #expect(SFTPRemoteHash.parseDigest("\(lower)\nextra-line") == nil)
+
+        #expect(SFTPRemoteHash.parseProbeOutput("shasum\n\(lower)  -\n")?.tool == .shasum)
+        #expect(SFTPRemoteHash.parseProbeOutput("openssl\nSHA2-256(stdin)= \(lower)\n")?.digest == lower)
+        #expect(SFTPRemoteHash.parseProbeOutput("unknownTool\n\(lower)\n") == nil)
+
+        // Candidate base directories include SFTP realpath and Synology `/volume1` mapping.
+        #expect(SFTPRemoteHash.candidateExecBases(sftpRealBase: "/Photos/2026", configuredBase: "Photos/2026")
+            == ["/Photos/2026", "/volume1/Photos/2026"])
+        #expect(SFTPRemoteHash.candidateExecBases(sftpRealBase: "/volume2/Media", configuredBase: "/volume2/Media")
+            == ["/volume2/Media"])
+
+        // End-to-end execution through real POSIX `/bin/sh` with hostile filename characters.
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let trickyName = "-Bob's $HOME `echo NO` \"clip\" (2026).MOV"
+        let trickyFile = dir.appendingPathComponent(trickyName)
+        var payload = Data(repeating: 0x5A, count: 10_000)
+        payload.replaceSubrange(0..<8, with: Data("PhotoSyn".utf8))
+        try payload.write(to: trickyFile)
+
+        let expectedFull = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        let expectedPrefix = SHA256.hash(data: payload.prefix(4096)).map { String(format: "%02x", $0) }.joined()
+
+        func runSh(_ command: String) throws -> String {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+            proc.arguments = ["-c", command]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            try proc.run()
+            proc.waitUntilExit()
+            #expect(proc.terminationStatus == 0)
+            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        }
+
+        let probeCmd = try #require(SFTPRemoteHash.buildProbeCommand(samplePath: trickyFile.path, prefixByteCount: 4096))
+        let probeOut = try runSh(probeCmd)
+        let parsedProbe = try #require(SFTPRemoteHash.parseProbeOutput(probeOut))
+        #expect(parsedProbe.digest == expectedPrefix)
+
+        let hashCmd = try #require(SFTPRemoteHash.buildHashCommand(tool: parsedProbe.tool, path: trickyFile.path))
+        let hashOut = try runSh(hashCmd)
+        #expect(SFTPRemoteHash.parseDigest(hashOut) == expectedFull)
+
+        let opensslCmd = try #require(SFTPRemoteHash.buildHashCommand(tool: .openssl, path: trickyFile.path))
+        let opensslOut = try runSh(opensslCmd)
+        #expect(SFTPRemoteHash.parseDigest(opensslOut) == expectedFull)
+    }
 }
