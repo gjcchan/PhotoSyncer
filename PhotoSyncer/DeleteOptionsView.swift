@@ -56,6 +56,20 @@ struct DeleteOptionsView: View {
                         }
                     }
                 ))
+                LabeledContent("Deletion queue") {
+                    HStack(spacing: 10) {
+                        Text(syncer.pendingDeleteSummary)
+                            .monospacedDigit()
+                            .foregroundStyle(syncer.pendingDeleteCount > 0 ? .primary : .secondary)
+                        if syncer.pendingDeleteCount > 0 {
+                            Button("Delete Queued Now…") {
+                                syncer.deleteQueuedNow()
+                            }
+                            .controlSize(.small)
+                            .disabled(syncer.isSyncing)
+                        }
+                    }
+                }
             }
 
             Group {

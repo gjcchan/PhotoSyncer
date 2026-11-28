@@ -106,7 +106,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let cloudWaitingRow = StatusRowView()
     private let cloudDiagnosisRow = StatusRowView(wraps: true)
     private let parkedRow = StatusRowView()
-    private let pendingDeleteRow = StatusRowView()
     private let lastErrorRow = StatusRowView(wraps: true)
 
     private var statusMenuItem: NSMenuItem!
@@ -115,7 +114,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var cloudWaitingItem: NSMenuItem!
     private var cloudDiagnosisItem: NSMenuItem!
     private var parkedItem: NSMenuItem!
-    private var pendingDeleteItem: NSMenuItem!
     private var lastErrorItem: NSMenuItem!
 
     // Persistent action items
@@ -191,7 +189,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         cloudWaitingItem = viewItem(cloudWaitingRow)
         cloudDiagnosisItem = viewItem(cloudDiagnosisRow)
         parkedItem = viewItem(parkedRow)
-        pendingDeleteItem = viewItem(pendingDeleteRow)
         lastErrorItem = viewItem(lastErrorRow)
 
         photosSettingsItem = actionItem("Open Photos Privacy Settings…", action: #selector(onOpenPhotosPrivacy))
@@ -211,7 +208,7 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let all: [NSMenuItem] = [
             titleItem,
             statusMenuItem, destProblemItem, failureItem, cloudWaitingItem,
-            cloudDiagnosisItem, parkedItem, pendingDeleteItem, lastErrorItem,
+            cloudDiagnosisItem, parkedItem, lastErrorItem,
             photosSettingsItem, openPhotosItem, automationItem, reconcileItem, loginApprovalItem,
             .separator(),
             syncNowItem, pauseResumeItem, retryPendingItem, deleteQueuedItem,
@@ -249,7 +246,9 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func updateIcon() {
-        let symbol = syncer.isPaused
+        let symbol = syncer.isVerifying
+            ? "arrow.triangle.2.circlepath.icloud.fill"
+            : syncer.isPaused
             ? "pause.circle"
             : syncer.waitingForDestination
             ? "externaldrive.badge.xmark"
@@ -290,7 +289,6 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
                              text: syncer.parkedCount > 0 ? "⏸ \(syncer.parkedCount) stopped retrying – Settings › Failed" : nil,
                              fallbackWhenOpen: "⏸ 0 stopped retrying",
                              allowStructural: allowStructuralChanges)
-        pendingDeleteRow.setText("Deletion queue: \(syncer.pendingDeleteSummary)", resizeHeight: allowStructuralChanges)
         updateOptionalStatus(lastErrorItem, row: lastErrorRow,
                              text: syncer.lastError.map { "⚠️ \($0)" },
                              fallbackWhenOpen: "",
@@ -307,8 +305,17 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
         let busy = syncer.isSyncing || syncer.isPaused
         if syncNowItem.isEnabled != !busy { syncNowItem.isEnabled = !busy }
 
-        let pauseTitle = syncer.isPaused ? "Resume Sync" : "Pause Sync"
+        let pauseTitle: String
+        let pauseEnabled: Bool
+        if syncer.isVerifying {
+            pauseTitle = syncer.verificationState.isCanceling ? "Canceling Verification…" : "Cancel Verification"
+            pauseEnabled = !syncer.verificationState.isCanceling
+        } else {
+            pauseTitle = syncer.isPaused ? "Resume Sync" : "Pause Sync"
+            pauseEnabled = true
+        }
         if pauseResumeItem.title != pauseTitle { pauseResumeItem.title = pauseTitle }
+        if pauseResumeItem.isEnabled != pauseEnabled { pauseResumeItem.isEnabled = pauseEnabled }
 
         let pending = syncer.failedCount + syncer.cloudWaitingCount
         setHidden(retryPendingItem, pending == 0)
@@ -387,7 +394,15 @@ final class StatusBarController: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func onReconcile() { syncer.confirmReconcile() }
     @objc private func onApproveLogin() { syncer.openLoginItemsSettings() }
     @objc private func onSyncNow() { syncer.syncNow() }
-    @objc private func onTogglePause() { if syncer.isPaused { syncer.resume() } else { syncer.pause() } }
+    @objc private func onTogglePause() {
+        if syncer.isVerifying {
+            syncer.cancelVerification()
+        } else if syncer.isPaused {
+            syncer.resume()
+        } else {
+            syncer.pause()
+        }
+    }
     @objc private func onRetryFailed() { syncer.retryFailed() }
     @objc private func onDeleteQueued() { syncer.deleteQueuedNow() }
     @objc private func onOpenSettings() { showSettings() }

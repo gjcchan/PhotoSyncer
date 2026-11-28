@@ -20,6 +20,12 @@ struct DestinationsView: View {
                     Button("Add SMB Share…") { showSMB = true }
                     Button("Add SFTP Server…") { showSFTP = true }
                 }
+                .disabled(syncer.isSyncing)
+                if syncer.isVerifying {
+                    Text("Destination changes are locked while file verification is running.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Keep destinations in sync") {
@@ -65,6 +71,7 @@ private struct DestinationRow: View {
         HStack(alignment: .top) {
             Toggle("", isOn: Binding(get: { dest.enabled }, set: { syncer.setEnabled(dest.id, $0) }))
                 .labelsHidden()
+                .disabled(syncer.isSyncing)
             VStack(alignment: .leading, spacing: 2) {
                 Text(dest.name).fontWeight(.semibold)
                 Text(dest.summary).font(.caption).foregroundStyle(.secondary)
@@ -85,6 +92,7 @@ private struct DestinationRow: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .disabled(syncer.isSyncing)
         }
         .confirmationDialog("Remove \(dest.name)?", isPresented: $confirmRemove) {
             Button("Remove Destination", role: .destructive) { syncer.removeDestination(dest.id) }

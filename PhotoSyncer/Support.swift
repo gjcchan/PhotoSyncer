@@ -128,6 +128,104 @@ nonisolated struct LibraryItem: Sendable {
     var bytes: Int64
 }
 
+/// Live progress and outcome state for on-demand destination file integrity verification.
+nonisolated struct DestinationVerificationState: Equatable, Sendable {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case connecting(destinationName: String, index: Int, totalDestinations: Int)
+        case running(
+            destinationName: String,
+            currentFile: String,
+            processedFiles: Int,
+            totalFiles: Int,
+            intactFiles: Int,
+            damagedFiles: Int,
+            startedAt: Date,
+            canceling: Bool
+        )
+        case completed(
+            intactFiles: Int,
+            damagedFiles: Int,
+            unreachableDestinations: [String],
+            finishedAt: Date
+        )
+        case canceled(
+            processedFiles: Int,
+            totalFiles: Int,
+            intactFiles: Int,
+            damagedFiles: Int,
+            finishedAt: Date
+        )
+        case failed(message: String, finishedAt: Date)
+    }
+
+    var phase: Phase = .idle
+
+    var isActive: Bool {
+        switch phase {
+        case .connecting, .running:
+            return true
+        case .idle, .completed, .canceled, .failed:
+            return false
+        }
+    }
+
+    var isCanceling: Bool {
+        switch phase {
+        case .running(_, _, _, _, _, _, _, let canceling):
+            return canceling
+        default:
+            return false
+        }
+    }
+
+    var fractionCompleted: Double? {
+        guard case .running(_, _, let processed, let total, _, _, _, _) = phase, total > 0 else {
+            return nil
+        }
+        return min(max(Double(processed) / Double(total), 0.0), 1.0)
+    }
+
+    var percentInt: Int? {
+        guard let frac = fractionCompleted else { return nil }
+        return Int((frac * 100.0).rounded(.down))
+    }
+
+    var menuStatusText: String? {
+        switch phase {
+        case .idle, .completed, .canceled, .failed:
+            return nil
+        case .connecting(let name, let index, let total):
+            if isCanceling { return "Canceling verification…" }
+            return total > 1
+                ? "Connecting to \(name) (\(index)/\(total)) for verification…"
+                : "Connecting to \(name) for verification…"
+        case .running(let destName, _, let processed, let total, _, _, _, let canceling):
+            if canceling { return "Canceling verification…" }
+            if total > 0 {
+                let pct = Int((min(max(Double(processed) / Double(total), 0.0), 1.0) * 100.0).rounded(.down))
+                return "Verifying \(destName) · \(processed)/\(total) (\(pct)%)"
+            }
+            return "Verifying \(destName)…"
+        }
+    }
+
+    mutating func markCanceling() {
+        if case .running(let dest, let file, let processed, let total, let intact, let damaged, let started, _) = phase {
+            phase = .running(
+                destinationName: dest,
+                currentFile: file,
+                processedFiles: processed,
+                totalFiles: total,
+                intactFiles: intact,
+                damagedFiles: damaged,
+                startedAt: started,
+                canceling: true
+            )
+        }
+    }
+}
+
 /// Errors that abort a whole run (as opposed to a single item failing).
 nonisolated enum SyncError: LocalizedError {
     case message(String)

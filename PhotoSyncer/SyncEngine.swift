@@ -163,6 +163,9 @@ final class SyncEngine: ObservableObject {
     @Published var deferredReason: String?
     /// Set when iCloud refuses to hand over originals for (nearly) everything: retrying won't help.
     @Published var cloudDiagnosis: String?
+    @Published private(set) var verificationState = DestinationVerificationState()
+
+    var isVerifying: Bool { verificationState.isActive }
 
     @Published var scheduleMode: SyncScheduleMode {
         didSet {
@@ -287,6 +290,7 @@ final class SyncEngine: ObservableObject {
     private var deleteRecalcTask: Task<Void, Never>?
     private var deleteRecalcGeneration: UInt64 = 0
     private var needsDeleteRecalc = false
+    private var verificationCancelRequested = false
     private var isTerminating = false                    // app quit / logout / OS restart in progress
     private var isTicking = false                        // prevents overlapping async reachability probes
     private var scrubOffsets: [String: Int] = [:]        // per-destination rolling checksum scrub cursor
@@ -367,6 +371,12 @@ final class SyncEngine: ObservableObject {
     var enabledDestinations: [Destination] { destinations.filter(\.enabled) }
 
     var statusText: String {
+        if isVerifying {
+            if verificationCancelRequested { return "Canceling verification…" }
+            if let text = verificationState.menuStatusText { return text }
+            if let phase { return phase }
+            return "Verifying destination files…"
+        }
         if isPaused {
             return isSyncing ? "Pausing… finishing current item"
                              : (total > 0 && done < total ? "Paused at \(done)/\(total)" : "Paused")
@@ -832,6 +842,12 @@ final class SyncEngine: ObservableObject {
 
     /// Lets the user pick a folder (local disk, USB drive, or a mounted NAS share).
     func addFolderDestination() {
+        guard !isSyncing else {
+            lastError = isVerifying
+                ? "Wait for destination verification to finish (or cancel it) before adding a destination."
+                : "Wait for the current sync to finish before adding a destination."
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -856,6 +872,12 @@ final class SyncEngine: ObservableObject {
     }
 
     func addSFTPDestination(_ d: Destination, password: String) {
+        guard !isSyncing else {
+            lastError = isVerifying
+                ? "Wait for destination verification to finish (or cancel it) before adding a destination."
+                : "Wait for the current sync to finish before adding a destination."
+            return
+        }
         let status = Keychain.setPassword(password, account: d.key)
         guard status == errSecSuccess else {
             lastError = "Could not store the SFTP password in the Keychain (error \(status))."
@@ -868,6 +890,12 @@ final class SyncEngine: ObservableObject {
     }
 
     func addSMBDestination(_ d: Destination, password: String) {
+        guard !isSyncing else {
+            lastError = isVerifying
+                ? "Wait for destination verification to finish (or cancel it) before adding a destination."
+                : "Wait for the current sync to finish before adding a destination."
+            return
+        }
         if d.guest != true {
             let status = Keychain.setPassword(password, account: d.key)
             guard status == errSecSuccess else {
@@ -891,7 +919,12 @@ final class SyncEngine: ObservableObject {
     }
 
     func removeDestination(_ id: UUID) {
-        guard !isSyncing else { lastError = "Wait for the current sync to finish before removing a destination."; return }
+        guard !isSyncing else {
+            lastError = isVerifying
+                ? "Wait for destination verification to finish (or cancel it) before removing a destination."
+                : "Wait for the current sync to finish before removing a destination."
+            return
+        }
         guard let d = destinations.first(where: { $0.id == id }) else { return }
         if d.kind == .smb {
             let key = d.key
@@ -908,6 +941,12 @@ final class SyncEngine: ObservableObject {
     }
 
     func setEnabled(_ id: UUID, _ on: Bool) {
+        guard !isSyncing else {
+            lastError = isVerifying
+                ? "Wait for destination verification to finish (or cancel it) before changing destinations."
+                : "Wait for the current sync to finish before changing destinations."
+            return
+        }
         guard let i = destinations.firstIndex(where: { $0.id == id }) else { return }
         destinations[i].enabled = on
         destStatus[destinations[i].key] = on ? "Not checked yet" : "Disabled"
@@ -917,6 +956,7 @@ final class SyncEngine: ObservableObject {
     }
 
     func forgetHostKey(_ id: UUID) {
+        guard !isSyncing else { return }
         guard let i = destinations.firstIndex(where: { $0.id == id }) else { return }
         destinations[i].trustedHostKey = nil
         log.warning("Forgot the pinned host key for \(destinations[i].name); it will be pinned again on next connect")
@@ -1201,26 +1241,55 @@ final class SyncEngine: ObservableObject {
     }
 
     /// Re-reads and checksum-verifies every recorded file across all enabled destinations on demand.
+    /// Runs independently of `isPaused` and locks out all sync/delete/destination mutations until
+    /// finished or explicitly canceled via `cancelVerification()`.
     func verifyDestinationsNow() {
-        guard !isSyncing, !isTerminating else { lastError = "A sync is running. Try again when it finishes."; return }
-        let enabled = enabledDestinations
-        guard !enabled.isEmpty else {
-            lastError = "No destination is enabled. Add or enable one in Settings › Destinations."
+        guard !isSyncing, !isTerminating else {
+            lastError = isVerifying
+                ? "Destination verification is already running."
+                : "A sync is running. Try again when it finishes."
             return
         }
+        let enabled = enabledDestinations
+        guard !enabled.isEmpty else {
+            let msg = "No destination is enabled. Add or enable one in Settings › Destinations."
+            lastError = msg
+            verificationState = DestinationVerificationState(phase: .failed(message: msg, finishedAt: Date()))
+            return
+        }
+
+        deleteRecalcGeneration &+= 1
+        deleteRecalcTask?.cancel()
+        deleteRecalcTask = nil
+
         isSyncing = true
-        phase = "Connecting to destinations for verification…"
+        verificationCancelRequested = false
         lastError = nil
+        let startedAt = Date()
+        let firstName = enabled.first?.name ?? "destination"
+        verificationState = DestinationVerificationState(
+            phase: .connecting(destinationName: firstName, index: 1, totalDestinations: enabled.count)
+        )
+        phase = verificationState.menuStatusText
+
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Verifying destination files")
-        let powerAssertion = PowerAssertion(name: "PhotoSyncer verifying destination files", timeout: 7200)
+        let powerAssertion = PowerAssertion(name: "PhotoSyncer verifying destination files", timeout: 14_400)
 
         activeTask = Task {
-            var checked = 0
-            var damaged = 0
+            var totalIntact = 0
+            var totalDamaged = 0
+            var totalProcessed = 0
+            var unreachableNames: [String] = []
             var rts: [DestRuntime] = []
-            for d in enabled {
-                if isTerminating || Task.isCancelled { break }
+
+            for (idx, d) in enabled.enumerated() {
+                if verificationCancelRequested || sleepPause || isTerminating || Task.isCancelled { break }
+                verificationState = DestinationVerificationState(
+                    phase: .connecting(destinationName: d.name, index: idx + 1, totalDestinations: enabled.count)
+                )
+                phase = verificationState.menuStatusText
+
                 var backend: DestinationBackend?
                 do {
                     let b = try makeBackend(d, allowCreateBase: false)
@@ -1230,65 +1299,192 @@ final class SyncEngine: ObservableObject {
                     let files = try await b.list()
                     rts.append(DestRuntime(dest: d, backend: b, listing: files))
                     setDestStatus(d, "Connected · \(files.count) files")
+                } catch is CancellationError {
+                    if let backend { await Task { await backend.close() }.value }
+                    break
                 } catch SyncError.destinationUnavailable(let m) {
-                    if let backend { await backend.close() }
-                    setDestStatus(d, "Waiting: \(m)")
-                    log.warning("\(d.name): \(m)")
+                    if let backend { await Task { await backend.close() }.value }
+                    if !verificationCancelRequested && !Task.isCancelled {
+                        unreachableNames.append(d.name)
+                        setDestStatus(d, "Waiting: \(m)")
+                        log.warning("\(d.name): \(m)")
+                    }
                 } catch {
-                    if let backend { await backend.close() }
-                    setDestStatus(d, "Error: \(error.localizedDescription)")
-                    log.error("\(d.name): \(ErrorInfo.describe(error))")
+                    if let backend { await Task { await backend.close() }.value }
+                    if !verificationCancelRequested && !Task.isCancelled {
+                        unreachableNames.append(d.name)
+                        setDestStatus(d, "Error: \(error.localizedDescription)")
+                        log.error("\(d.name): \(ErrorInfo.describe(error))")
+                    }
                 }
             }
             active = rts
 
-            for rt in rts where !rt.unavailable {
-                let items = store.allPlacements(dest: rt.key)
-                for (i, item) in items.enumerated() {
-                    if isPaused || sleepPause || isTerminating || Task.isCancelled { break }
-                    phase = "Verifying \(rt.name) (\(i + 1)/\(items.count))…"
+            let workPerDest: [(rt: DestRuntime, items: [(hash: String, name: String)])] = rts
+                .filter { !$0.unavailable }
+                .map { rt in (rt, store.allPlacements(dest: rt.key)) }
+            let grandTotal = workPerDest.reduce(0) { $0 + $1.items.count }
+
+            var wasCanceled = verificationCancelRequested || sleepPause || isTerminating || Task.isCancelled
+            var lastUIUpdateNs: UInt64 = 0
+
+            if !wasCanceled && !rts.isEmpty {
+                verificationState = DestinationVerificationState(
+                    phase: .running(
+                        destinationName: workPerDest.first?.rt.name ?? firstName,
+                        currentFile: workPerDest.first?.items.first?.name ?? "",
+                        processedFiles: 0,
+                        totalFiles: grandTotal,
+                        intactFiles: 0,
+                        damagedFiles: 0,
+                        startedAt: startedAt,
+                        canceling: false
+                    )
+                )
+                phase = verificationState.menuStatusText
+            }
+
+            outerLoop: for entry in workPerDest where !entry.rt.unavailable {
+                let rt = entry.rt
+                var destIntact = 0
+                var destDamaged = 0
+
+                for (i, item) in entry.items.enumerated() {
+                    if verificationCancelRequested || sleepPause || isTerminating || Task.isCancelled {
+                        wasCanceled = true
+                        break outerLoop
+                    }
+
+                    let nowNs = DispatchTime.now().uptimeNanoseconds
+                    if i == 0 || (nowNs - lastUIUpdateNs) >= 100_000_000 {
+                        lastUIUpdateNs = nowNs
+                        verificationState = DestinationVerificationState(
+                            phase: .running(
+                                destinationName: rt.name,
+                                currentFile: item.name,
+                                processedFiles: totalProcessed,
+                                totalFiles: grandTotal,
+                                intactFiles: totalIntact,
+                                damagedFiles: totalDamaged,
+                                startedAt: startedAt,
+                                canceling: verificationCancelRequested
+                            )
+                        )
+                        phase = verificationState.menuStatusText
+                    }
+
                     let k = FileNames.key(item.name)
                     guard rt.names.contains(k) else {
                         store.dropPlacements(dest: rt.key, hashes: [item.hash])
-                        damaged += 1
+                        destDamaged += 1
+                        totalDamaged += 1
+                        totalProcessed += 1
+                        lastUIUpdateNs = 0      // publish damaged count immediately on next iteration
                         log.warning("\(rt.name): \(item.name) is missing; queued for restore")
                         continue
                     }
+
                     do {
                         let actual = try await rt.backend.hash(of: rt.actualNames[k] ?? item.name, noCache: true)
-                        checked += 1
+                        if verificationCancelRequested || Task.isCancelled {
+                            wasCanceled = true
+                            break outerLoop
+                        }
+                        totalProcessed += 1
                         if actual != item.hash {
                             store.dropPlacements(dest: rt.key, hashes: [item.hash])
-                            damaged += 1
+                            destDamaged += 1
+                            totalDamaged += 1
+                            lastUIUpdateNs = 0
                             log.error("\(rt.name): \(item.name) failed checksum verification; queued for restore")
+                        } else {
+                            destIntact += 1
+                            totalIntact += 1
                         }
+                    } catch is CancellationError {
+                        wasCanceled = true
+                        break outerLoop
                     } catch SyncError.destinationUnavailable(let m) {
+                        if verificationCancelRequested || Task.isCancelled {
+                            wasCanceled = true
+                            break outerLoop
+                        }
+                        unreachableNames.append(rt.name)
                         markUnavailable(rt, m)
                         break
                     } catch {
-                        damaged += 1
+                        if verificationCancelRequested || Task.isCancelled {
+                            wasCanceled = true
+                            break outerLoop
+                        }
+                        totalProcessed += 1
+                        destDamaged += 1
+                        totalDamaged += 1
+                        lastUIUpdateNs = 0
                         store.dropPlacements(dest: rt.key, hashes: [item.hash])
                         log.error("\(rt.name): could not read \(item.name) (\(error.localizedDescription)); queued for restore")
                     }
                 }
-                if !rt.unavailable { setDestStatus(rt.dest, "Verified · \(checked) OK") }
+
+                if !rt.unavailable && !wasCanceled {
+                    setDestStatus(
+                        rt.dest,
+                        destDamaged == 0
+                            ? "Verified · \(destIntact) OK"
+                            : "Verified · \(destIntact) OK, \(destDamaged) damaged"
+                    )
+                }
             }
 
-            if damaged > 0 {
+            if totalDamaged > 0 {
                 needsResume = true
                 store.save()
                 surfaceSaveError()
-                log.warning("Destination verification finished: \(checked) intact, \(damaged) missing or corrupted (will restore on next sync)")
-                lastError = "\(damaged) file(s) were missing or corrupted and will be restored automatically."
-            } else if !rts.isEmpty {
-                log.info("Destination verification finished: all \(checked) file(s) passed uncached SHA-256 verification")
+            }
+
+            let finishedAt = Date()
+            if wasCanceled {
+                log.info("Destination verification canceled (\(totalProcessed)/\(grandTotal) checked: \(totalIntact) intact, \(totalDamaged) missing or corrupted)")
+                verificationState = DestinationVerificationState(
+                    phase: .canceled(
+                        processedFiles: totalProcessed,
+                        totalFiles: grandTotal,
+                        intactFiles: totalIntact,
+                        damagedFiles: totalDamaged,
+                        finishedAt: finishedAt
+                    )
+                )
+            } else if rts.isEmpty {
+                let names = unreachableNames.isEmpty ? enabled.map(\.name) : unreachableNames
+                let msg = "Could not connect to \(names.joined(separator: ", ")). Check that the destination is online."
+                lastError = msg
+                verificationState = DestinationVerificationState(phase: .failed(message: msg, finishedAt: finishedAt))
+            } else {
+                if totalDamaged > 0 {
+                    log.warning("Destination verification finished: \(totalIntact) intact, \(totalDamaged) missing or corrupted (will restore on next sync)")
+                    lastError = "\(totalDamaged) file(s) were missing or corrupted and will be restored automatically."
+                } else {
+                    log.info("Destination verification finished: all \(totalIntact) file(s) passed uncached SHA-256 verification")
+                }
+                verificationState = DestinationVerificationState(
+                    phase: .completed(
+                        intactFiles: totalIntact,
+                        damagedFiles: totalDamaged,
+                        unreachableDestinations: unreachableNames,
+                        finishedAt: finishedAt
+                    )
+                )
             }
 
             let finished = active
             active = []
-            for rt in finished { await rt.backend.close() }
+            // Run backend teardown in an uncanceled task so SMB unmounts and SFTP channels close cleanly even after cancel.
+            await Task { @MainActor in
+                for rt in finished { await rt.backend.close() }
+            }.value
             powerAssertion.release()
             ProcessInfo.processInfo.endActivity(activity)
+            verificationCancelRequested = false
             isSyncing = false
             phase = nil
             activeTask = nil
@@ -1297,6 +1493,15 @@ final class SyncEngine: ObservableObject {
                 scheduleDeleteQueueRecalculation()
             }
         }
+    }
+
+    func cancelVerification() {
+        guard isVerifying, !verificationCancelRequested else { return }
+        verificationCancelRequested = true
+        verificationState.markCanceling()
+        phase = verificationState.menuStatusText
+        log.info("Canceling destination verification…")
+        activeTask?.cancel()
     }
 
     // MARK: Parked items (stopped auto-retrying)
@@ -1344,6 +1549,7 @@ final class SyncEngine: ObservableObject {
     /// Stops after the item currently in flight (a download can't be safely cut mid-way),
     /// saves the ledger and keeps scheduled syncs off until resumed. Persists across restarts.
     func pause() {
+        guard !isVerifying else { return }
         guard !isPaused else { return }
         isPaused = true
         deferredReason = nil
@@ -1352,6 +1558,7 @@ final class SyncEngine: ObservableObject {
 
     /// Continues immediately where the ledger left off (already-synced items are skipped).
     func resume() {
+        guard !isVerifying else { return }
         guard isPaused else { return }
         isPaused = false
         log.info("Sync resumed by user")

@@ -806,4 +806,56 @@ struct CrashRecoveryTests {
         let opensslOut = try runSh(opensslCmd)
         #expect(SFTPRemoteHash.parseDigest(opensslOut) == expectedFull)
     }
+
+    @Test func destinationVerificationProgressAndCancelTransitions() {
+        var state = DestinationVerificationState()
+        #expect(!state.isActive)
+        #expect(state.fractionCompleted == nil)
+        #expect(state.menuStatusText == nil)
+
+        state.phase = .connecting(destinationName: "NAS", index: 1, totalDestinations: 2)
+        #expect(state.isActive)
+        #expect(state.menuStatusText == "Connecting to NAS (1/2) for verification…")
+
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+        state.phase = .running(
+            destinationName: "NAS",
+            currentFile: "IMG_0019.MOV",
+            processedFiles: 750,
+            totalFiles: 3_000,
+            intactFiles: 749,
+            damagedFiles: 1,
+            startedAt: t0,
+            canceling: false
+        )
+        #expect(state.isActive)
+        #expect(!state.isCanceling)
+        #expect(state.fractionCompleted == 0.25)
+        #expect(state.percentInt == 25)
+        #expect(state.menuStatusText == "Verifying NAS · 750/3000 (25%)")
+
+        state.markCanceling()
+        #expect(state.isActive)
+        #expect(state.isCanceling)
+        #expect(state.menuStatusText == "Canceling verification…")
+
+        state.phase = .canceled(
+            processedFiles: 750,
+            totalFiles: 3_000,
+            intactFiles: 749,
+            damagedFiles: 1,
+            finishedAt: t0.addingTimeInterval(10)
+        )
+        #expect(!state.isActive)
+        #expect(!state.isCanceling)
+        #expect(state.menuStatusText == nil)
+
+        state.phase = .completed(
+            intactFiles: 3_000,
+            damagedFiles: 0,
+            unreachableDestinations: [],
+            finishedAt: t0.addingTimeInterval(60)
+        )
+        #expect(!state.isActive)
+    }
 }

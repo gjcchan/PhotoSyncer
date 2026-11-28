@@ -487,19 +487,178 @@ private struct MaintenanceTab: View {
     var body: some View {
         Form {
             Section("Integrity") {
-                Text("Reads back every synced file from each enabled destination without using the OS file cache and checks its SHA-256 checksum against the ledger. Any missing or damaged copies are automatically queued to be restored on the next sync.")
-                    .font(.callout).foregroundStyle(.secondary)
-                Button("Verify Destination Files Now") { syncer.verifyDestinationsNow() }
-                    .disabled(syncer.isSyncing)
+                Text("Verifies the SHA-256 checksum of every synced file across each enabled destination (uncached read-back for folders and SMB; server-side SSH SHA-256 or read-back for SFTP). Any missing or damaged copies are automatically queued to be restored on the next sync.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                verificationProgressAndStatusView
+
+                HStack(spacing: 10) {
+                    if syncer.isVerifying {
+                        Button("Cancel Verification", role: .cancel) {
+                            syncer.cancelVerification()
+                        }
+                        .disabled(syncer.verificationState.isCanceling)
+                    } else {
+                        Button("Verify Destination Files Now") {
+                            syncer.verifyDestinationsNow()
+                        }
+                        .disabled(syncer.isSyncing || syncer.enabledDestinations.isEmpty)
+                        if syncer.isSyncing {
+                            Text("Wait for the current sync to finish before starting verification.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if syncer.enabledDestinations.isEmpty {
+                            Text("Enable at least one destination first.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
 
             Section("Reset") {
                 Text("Deletes all logs and the sync history, then re-scans your whole Photos library and rebuilds from scratch. Files already in your destination folder are not deleted. You will be asked to confirm.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Button("Purge Logs & Rebuild…", role: .destructive) { syncer.confirmAndReset() }
                     .disabled(syncer.isSyncing)
             }
         }
         .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var verificationProgressAndStatusView: some View {
+        switch syncer.verificationState.phase {
+        case .idle:
+            EmptyView()
+
+        case .connecting(let destName, let index, let total):
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(total > 1
+                         ? "Connecting to \(destName) (\(index) of \(total))…"
+                         : "Connecting to \(destName)…")
+                        .fontWeight(.medium)
+                }
+                Text("Scheduled syncs, deletions, and destination changes are paused until verification finishes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+
+        case .running(let destName, let currentFile, let processed, let total, let intact, let damaged, _, let canceling):
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(canceling ? "Canceling verification…" : "Verifying \(destName)…")
+                        .fontWeight(.medium)
+                    Spacer()
+                    if total > 0 {
+                        let pct = syncer.verificationState.percentInt ?? 0
+                        Text("\(processed.formatted()) / \(total.formatted()) (\(pct)%)")
+                            .font(.callout)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if total > 0 {
+                    ProgressView(value: Double(min(processed, total)), total: Double(total))
+                        .progressViewStyle(.linear)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                }
+
+                HStack(spacing: 12) {
+                    if !currentFile.isEmpty && !canceling {
+                        Text("Checking \(currentFile)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                    Text("\(intact.formatted()) intact")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    if damaged > 0 {
+                        Text("\(damaged.formatted()) damaged/missing")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Text("Scheduled syncs, deletions, and destination changes are paused until verification finishes.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.vertical, 4)
+
+        case .completed(let intact, let damaged, let unreachable, let finishedAt):
+            let hasIssues = damaged > 0 || !unreachable.isEmpty
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: hasIssues ? "exclamationmark.triangle.fill" : "checkmark.shield.fill")
+                    .foregroundStyle(hasIssues ? .orange : .green)
+                VStack(alignment: .leading, spacing: 2) {
+                    if damaged == 0 && unreachable.isEmpty {
+                        Text("Verification complete: all \(intact.formatted()) file(s) matched their recorded SHA-256 checksums.")
+                            .font(.callout.weight(.medium))
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        if damaged > 0 {
+                            Text("Verification complete: \(intact.formatted()) intact, \(damaged.formatted()) missing or corrupted (queued for restore on next sync).")
+                                .font(.callout.weight(.medium))
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Verified \(intact.formatted()) file(s) on reachable destinations.")
+                                .font(.callout.weight(.medium))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if !unreachable.isEmpty {
+                            Text("Skipped unreachable destination(s): \(unreachable.joined(separator: ", ")).")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Text("Finished \(finishedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+
+        case .canceled(let processed, let total, let intact, let damaged, let finishedAt):
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "stop.circle.fill")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Verification canceled after \(processed.formatted()) of \(total.formatted()) file(s) (\(intact.formatted()) intact\(damaged > 0 ? ", \(damaged.formatted()) queued for restore" : "")).")
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Stopped \(finishedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+
+        case .failed(let message, _):
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(message)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.vertical, 4)
+        }
     }
 }
