@@ -397,7 +397,8 @@ nonisolated enum LocalPreview {
 
         for res in candidates {
             try? FileManager.default.removeItem(at: url)
-            if await writeResourceLocal(res, to: url), await isPlayableVideo(at: url) {
+            if await writeResourceLocal(res, to: url),
+               await isPlayableVideo(at: url, declaredUTI: res.uniformTypeIdentifier, fallbackName: res.originalFilename) {
                 return preferredExt(for: res.contentType, fallbackName: res.originalFilename, defaultExt: "mov")
             }
         }
@@ -449,7 +450,7 @@ nonisolated enum LocalPreview {
         case .none:
             return nil
         case .copied(let ext):
-            return await isPlayableVideo(at: url) ? ext : nil
+            return await isPlayableVideo(at: url, fallbackName: "preview.\(ext)") ? ext : nil
         case .composition(let box):
             guard let session = AVAssetExportSession(asset: box.av, presetName: AVAssetExportPresetHighestQuality) else {
                 return nil
@@ -464,17 +465,18 @@ nonisolated enum LocalPreview {
                 try await session.export(to: tmp, as: ft)
                 try? FileManager.default.removeItem(at: url)
                 try FileManager.default.moveItem(at: tmp, to: url)
-                return await isPlayableVideo(at: url) ? ext : nil
+                return await isPlayableVideo(at: url, declaredUTI: ft.rawValue, fallbackName: "preview.\(ext)") ? ext : nil
             } catch {
                 return nil
             }
         }
     }
 
-    private static func isPlayableVideo(at url: URL) async -> Bool {
+    private static func isPlayableVideo(at url: URL, declaredUTI: String? = nil, fallbackName: String? = nil) async -> Bool {
         guard let size = FileHash.size(of: url), size > 0 else { return false }
-        let av = AVURLAsset(url: url)
-        guard (try? await av.load(.isPlayable)) == true else { return false }
+        guard let av = await VideoInspector.loadPlayableAsset(at: url, declaredUTI: declaredUTI, fallbackFilename: fallbackName) else {
+            return false
+        }
         let tracks = (try? await av.loadTracks(withMediaType: .video)) ?? []
         return !tracks.isEmpty
     }
@@ -692,11 +694,123 @@ nonisolated enum LocalPreview {
         if let e = type?.preferredFilenameExtension?.lowercased(), !e.isEmpty {
             return e == "jpeg" ? "jpg" : e
         }
-        if let fallbackName {
-            let e = (fallbackName as NSString).pathExtension.lowercased()
+        if fallbackName != nil {
+            let e = ((fallbackName ?? "") as NSString).pathExtension.lowercased()
             if !e.isEmpty { return e == "jpeg" ? "jpg" : e }
         }
         return defaultExt
+    }
+}
+
+/// Validates staged and preview video files (including Live Photo `.MOV` paired videos).
+///
+/// On macOS, `AVURLAsset(url:)` inspects the `file://` URL's path extension unless
+/// `AVURLAssetOutOfBandMIMETypeKey` is provided; an extensionless staging file causes
+/// `AVURLAsset.load(.isPlayable)` to return `false` even for valid QuickTime/MP4 containers.
+/// `VideoInspector` both derives the right staging file extension and falls back to container
+/// magic-byte / UTI MIME hints when opening extensionless files.
+nonisolated enum VideoInspector {
+    static func stagingExtension(originalFilename: String, uniformTypeIdentifier: String) -> String {
+        let rawExt = (originalFilename as NSString).pathExtension.lowercased()
+        let cleanScalars = rawExt.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+        if !cleanScalars.isEmpty {
+            return String(String.UnicodeScalarView(cleanScalars))
+        }
+        if let utExt = UTType(uniformTypeIdentifier)?.preferredFilenameExtension?.lowercased(), !utExt.isEmpty {
+            return utExt
+        }
+        return ""
+    }
+
+    static func sniffMIMEType(at url: URL, declaredUTI: String? = nil, fallbackFilename: String? = nil) -> String? {
+        if let h = try? FileHandle(forReadingFrom: url) {
+            let header = (try? h.read(upToCount: 16)) ?? Data()
+            try? h.close()
+            if header.count >= 12 {
+                let boxType = String(decoding: header[4..<8], as: UTF8.self)
+                if boxType == "ftyp" {
+                    let brand = String(decoding: header[8..<12], as: UTF8.self)
+                    if brand == "qt  " { return "video/quicktime" }
+                    if brand == "M4V " || brand == "M4VH" || brand == "M4VP" { return "video/x-m4v" }
+                    return "video/mp4"
+                }
+                if boxType == "wide" || boxType == "mdat" || boxType == "moov" || boxType == "free" || boxType == "skip" {
+                    return "video/quicktime"
+                }
+                if header.starts(with: [0x1A, 0x45, 0xDF, 0xA3]) {
+                    return "video/x-matroska"
+                }
+                if String(decoding: header[0..<4], as: UTF8.self) == "RIFF",
+                   String(decoding: header[8..<12], as: UTF8.self) == "AVI " {
+                    return "video/avi"
+                }
+            }
+        }
+        if let declaredUTI, let mime = UTType(declaredUTI)?.preferredMIMEType {
+            return mime
+        }
+        if let fallbackFilename {
+            let ext = (fallbackFilename as NSString).pathExtension
+            if !ext.isEmpty, let mime = UTType(filenameExtension: ext)?.preferredMIMEType {
+                return mime
+            }
+        }
+        let urlExt = url.pathExtension
+        if !urlExt.isEmpty, let mime = UTType(filenameExtension: urlExt)?.preferredMIMEType {
+            return mime
+        }
+        return nil
+    }
+
+    static func loadPlayableAsset(at url: URL,
+                                  declaredUTI: String? = nil,
+                                  fallbackFilename: String? = nil) async -> AVURLAsset? {
+        if !url.pathExtension.isEmpty {
+            let direct = AVURLAsset(url: url)
+            if (try? await direct.load(.isPlayable)) == true {
+                return direct
+            }
+        }
+        if let mime = sniffMIMEType(at: url, declaredUTI: declaredUTI, fallbackFilename: fallbackFilename) {
+            let hinted = AVURLAsset(url: url, options: ["AVURLAssetOutOfBandMIMETypeKey": mime])
+            if (try? await hinted.load(.isPlayable)) == true {
+                return hinted
+            }
+        }
+        if url.pathExtension.isEmpty {
+            let plain = AVURLAsset(url: url)
+            if (try? await plain.load(.isPlayable)) == true {
+                return plain
+            }
+        }
+        return nil
+    }
+
+    static func validateVideoFile(at url: URL,
+                                  declaredUTI: String? = nil,
+                                  fallbackFilename: String? = nil,
+                                  expectedDuration: TimeInterval? = nil) async throws {
+        guard let sz = FileHash.size(of: url), sz > 0 else {
+            throw SyncError.message("Downloaded file is empty")
+        }
+        guard let av = await loadPlayableAsset(at: url, declaredUTI: declaredUTI, fallbackFilename: fallbackFilename) else {
+            throw SyncError.message("Exported video cannot be played (corrupt or truncated)")
+        }
+        let tracks = (try? await av.loadTracks(withMediaType: .video)) ?? []
+        guard let track = tracks.first else {
+            throw SyncError.message("Exported video contains no video track")
+        }
+        if let size = try? await track.load(.naturalSize), size.width <= 0 || size.height <= 0 {
+            throw SyncError.message("Exported video has invalid frame dimensions")
+        }
+        let dur = (try? await av.load(.duration)) ?? .zero
+        guard dur.isNumeric, dur.seconds > 0 else {
+            throw SyncError.message("Exported video has invalid or zero duration")
+        }
+        if let expectedDuration, expectedDuration > 2.0, dur.seconds < expectedDuration * 0.8 {
+            throw SyncError.message(
+                String(format: "Exported video is %.1f s but expected %.1f s (truncated)", dur.seconds, expectedDuration))
+        }
     }
 }
 

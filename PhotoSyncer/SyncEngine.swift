@@ -1358,7 +1358,7 @@ final class SyncEngine: ObservableObject {
         guard !isSyncing else { return }                    // pause hadn't taken effect yet: run just continues
         guard !enabledDestinations.isEmpty else { return }
         runBackoffUntil = .distantPast
-        startSync()
+        startSync(includeBackedOff: true)
     }
 
     private func pauseCheck() throws {
@@ -2395,7 +2395,11 @@ final class SyncEngine: ObservableObject {
     private func stageResource(_ res: PHAssetResource, asset: PHAsset, isPrimary: Bool, hasEdits: Bool,
                                exportFolder: URL?) async throws -> StagedFile {
         try? FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-        let staged = stagingDir.appendingPathComponent(UUID().uuidString)
+        let ext = VideoInspector.stagingExtension(
+            originalFilename: res.originalFilename,
+            uniformTypeIdentifier: res.uniformTypeIdentifier
+        )
+        let staged = stagingDir.appendingPathComponent(ext.isEmpty ? UUID().uuidString : "\(UUID().uuidString).\(ext)")
         var success = false
         defer { if !success { try? FileManager.default.removeItem(at: staged) } }
 
@@ -2443,7 +2447,21 @@ final class SyncEngine: ObservableObject {
                 throw SyncError.message("Downloaded file is empty")
             }
             if isVideo {
-                try await Self.verifyVideo(staged, asset: asset, isPrimary: isPrimary, hasEdits: hasEdits)
+                do {
+                    try await Self.verifyVideo(
+                        staged,
+                        declaredUTI: declaredUTI,
+                        fallbackFilename: res.originalFilename,
+                        asset: asset,
+                        isPrimary: isPrimary,
+                        hasEdits: hasEdits
+                    )
+                } catch {
+                    if !isPrimary {
+                        throw SyncError.message("\(res.originalFilename): \(error.localizedDescription)")
+                    }
+                    throw error
+                }
             }
         }
         let (hash, size) = try await FileHash.sha256AndSize(of: staged)   // checksum + exact byte size of the true original
@@ -2518,29 +2536,21 @@ final class SyncEngine: ObservableObject {
     }
 
     /// Proves a staged video container is playable, carries a valid video track, and wasn't truncated.
-    nonisolated private static func verifyVideo(_ url: URL, asset: PHAsset, isPrimary: Bool, hasEdits: Bool) async throws {
-        let av = AVURLAsset(url: url)
-        let playable = (try? await av.load(.isPlayable)) ?? false
-        guard playable else {
-            throw SyncError.message("Exported video cannot be played (corrupt or truncated)")
-        }
-        let tracks = (try? await av.loadTracks(withMediaType: .video)) ?? []
-        guard let track = tracks.first else {
-            throw SyncError.message("Exported video contains no video track")
-        }
-        if let size = try? await track.load(.naturalSize), size.width <= 0 || size.height <= 0 {
-            throw SyncError.message("Exported video has invalid frame dimensions")
-        }
-        let dur = (try? await av.load(.duration)) ?? .zero
-        guard dur.isNumeric, dur.seconds > 0 else {
-            throw SyncError.message("Exported video has invalid or zero duration")
-        }
-        if isPrimary, !hasEdits, !asset.mediaSubtypes.contains(.videoHighFrameRate), asset.duration > 2.0 {
-            if dur.seconds < asset.duration * 0.8 {
-                throw SyncError.message(
-                    String(format: "Exported video is %.1f s but expected %.1f s (truncated)", dur.seconds, asset.duration))
-            }
-        }
+    nonisolated private static func verifyVideo(_ url: URL,
+                                                declaredUTI: String,
+                                                fallbackFilename: String,
+                                                asset: PHAsset,
+                                                isPrimary: Bool,
+                                                hasEdits: Bool) async throws {
+        let expectedDuration: TimeInterval? = (isPrimary && !hasEdits && !asset.mediaSubtypes.contains(.videoHighFrameRate) && asset.duration > 2.0)
+            ? asset.duration
+            : nil
+        try await VideoInspector.validateVideoFile(
+            at: url,
+            declaredUTI: declaredUTI,
+            fallbackFilename: fallbackFilename,
+            expectedDuration: expectedDuration
+        )
     }
 
     nonisolated private static func targetName(_ res: PHAssetResource, primaryBase: String, isPrimary: Bool) -> String {
@@ -2721,6 +2731,13 @@ final class SyncEngine: ObservableObject {
             try await exportWithRetry(id: id, asset: asset, tracker: tracker)
             if wasTracked && !store.isFailing(id) { refreshCounts() }   // live decrease
             return .synced
+        } catch SyncError.paused {
+            throw SyncError.paused
+        } catch is CancellationError {
+            throw SyncError.paused
+        } catch SyncError.destinationUnavailable(let m) {
+            store.save()
+            throw SyncError.destinationUnavailable(m)
         } catch SyncError.diskFull {
             store.save()
             throw SyncError.diskFull                                // every destination is full: stop the run

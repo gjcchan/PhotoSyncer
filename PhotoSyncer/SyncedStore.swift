@@ -198,6 +198,13 @@ final class SyncedStore {
         } else if let data = try? Data(contentsOf: v0), let ids = try? JSONDecoder().decode([String].self, from: data) {
             for id in ids { ledger.entries[id] = Entry(parts: [], verified: false, legacy: true) }
         }
+
+        // Clean up any spurious "Paused" entries recorded when concurrent workers stopped on user pause.
+        let beforeCount = ledger.failures.count
+        ledger.failures = ledger.failures.filter { !($0.value.cloud != true && $0.value.message == "Paused") }
+        if ledger.failures.count != beforeCount {
+            save()
+        }
     }
 
     /// Corrupt ledger: keep the bad file for inspection and rebuild knowledge from the files

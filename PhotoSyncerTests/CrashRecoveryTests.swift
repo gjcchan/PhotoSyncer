@@ -1,4 +1,7 @@
 import Foundation
+import AVFoundation
+import CoreMedia
+import CoreVideo
 import CryptoKit
 import Testing
 @testable import PhotoSyncer
@@ -648,5 +651,91 @@ struct CrashRecoveryTests {
         reloaded.clearDeleteQueue(clearCandidates: true)
         #expect(reloaded.pendingDelete.isEmpty)
         #expect(reloaded.justSyncedCandidates.isEmpty)
+    }
+
+    @Test func videoInspectorValidatesMovWithAndWithoutExtension() async throws {
+        #expect(VideoInspector.stagingExtension(
+            originalFilename: "IMG_0019.MOV",
+            uniformTypeIdentifier: "com.apple.quicktime-movie"
+        ) == "mov")
+        #expect(VideoInspector.stagingExtension(
+            originalFilename: "IMG_0019",
+            uniformTypeIdentifier: "com.apple.quicktime-movie"
+        ) == "mov")
+
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let movURL = dir.appendingPathComponent("paired-\(UUID().uuidString).mov")
+        let noExtURL = dir.appendingPathComponent(UUID().uuidString)
+        let corruptURL = dir.appendingPathComponent("corrupt-\(UUID().uuidString).mov")
+
+        let writer = try AVAssetWriter(outputURL: movURL, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: 320,
+            AVVideoHeightKey: 240,
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: 320,
+            kCVPixelBufferHeightKey as String: 240,
+        ])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(nil, 320, 240, kCVPixelFormatType_32BGRA, nil, &pb)
+        if let pb {
+            _ = adaptor.append(pb, withPresentationTime: .zero)
+            _ = adaptor.append(pb, withPresentationTime: CMTime(value: 1, timescale: 1))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+
+        try FileManager.default.copyItem(at: movURL, to: noExtURL)
+        try Data("not a valid video".utf8).write(to: corruptURL)
+
+        // Valid QuickTime `.mov` succeeds both with `.mov` extension and on an extensionless UUID staging file.
+        try await VideoInspector.validateVideoFile(
+            at: movURL,
+            declaredUTI: "com.apple.quicktime-movie",
+            fallbackFilename: "IMG_0019.MOV"
+        )
+        try await VideoInspector.validateVideoFile(
+            at: noExtURL,
+            declaredUTI: "com.apple.quicktime-movie",
+            fallbackFilename: "IMG_0019.MOV"
+        )
+
+        // Corrupt file and truncated-duration file are still rejected.
+        var rejectedCorrupt = false
+        do {
+            try await VideoInspector.validateVideoFile(at: corruptURL, declaredUTI: "com.apple.quicktime-movie")
+        } catch {
+            rejectedCorrupt = true
+        }
+        #expect(rejectedCorrupt)
+
+        var rejectedTruncated = false
+        do {
+            try await VideoInspector.validateVideoFile(
+                at: movURL,
+                declaredUTI: "com.apple.quicktime-movie",
+                expectedDuration: 10.0
+            )
+        } catch {
+            rejectedTruncated = true
+        }
+        #expect(rejectedTruncated)
+
+        // Spurious "Paused" non-cloud failures from earlier builds are stripped on load.
+        let store = SyncedStore(legacyDestinationID: nil, directory: dir)
+        store.recordFailure(id: "paused-item", name: "IMG_0030.MOV", message: "Paused", cloud: false)
+        store.recordFailure(id: "real-fail", name: "IMG_0031.MOV", message: "Disk error", cloud: false)
+        #expect(store.save())
+        let reloaded = SyncedStore(legacyDestinationID: nil, directory: dir)
+        #expect(!reloaded.isFailing("paused-item"))
+        #expect(reloaded.isFailing("real-fail"))
     }
 }
